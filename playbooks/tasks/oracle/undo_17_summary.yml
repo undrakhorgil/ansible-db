@@ -1,0 +1,21 @@
+---
+# Step 17 writes grid_environment_summary.html on the control host — remove it on undo when configured.
+- name: Undo 17 remove local Grid summary HTML on control host
+  ansible.builtin.file:
+    path: "{{ playbook_dir }}/../grid_environment_summary.html"
+    state: absent
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  run_once: true
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - oracle_undo_17_delete_local_summary | default(true) | bool
+  failed_when: false
+
+- name: Undo 17 note
+  ansible.builtin.debug:
+    msg: "Summary step had no server-side state; local HTML removed when oracle_undo_17_delete_local_summary is true."
+  run_once: true
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)

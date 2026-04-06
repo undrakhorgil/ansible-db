@@ -1,0 +1,161 @@
+---
+# Step 15: create non-CRS ASM disk groups (DATA/FRA/custom) from asm_diskgroups.
+
+- name: Import ASM SID facts for this host
+  ansible.builtin.import_tasks: asm_sid_facts.yml
+
+- name: Skip ASM diskgroup creation when no disks configured
+  ansible.builtin.debug:
+    msg: "Skipping ASM diskgroup creation — set asm_diskgroups[*] with used_for_grid_crs: false and disks in group_vars/all.yml."
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - ((asm_diskgroups | default([]) | rejectattr('used_for_grid_crs', 'equalto', true) | selectattr('disks', 'defined') | map(attribute='disks') | map('length') | list | sum) | int) == 0
+
+# sqlplus / as sysasm requires +ASM up; ORACLE_SID must be quoted in bash (leading + is special).
+- name: Create non-CRS ASM disk groups (when configured)
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - ((asm_diskgroups | default([]) | rejectattr('used_for_grid_crs', 'equalto', true) | selectattr('disks', 'defined') | map(attribute='disks') | map('length') | list | sum) | int) > 0
+  block:
+    # Root runs the module (ansible_remote_tmp); sqlplus runs as grid (same as step 16 / undo 15).
+    - name: Preflight — ASM instance running (required for sqlplus / as sysasm)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        runuser -u "{{ grid_user }}" -- /bin/bash <<'EOSCRIPT'
+        set -euo pipefail
+        export ORACLE_HOME="{{ grid_home }}"
+        export ORACLE_SID='{{ asm_instance_sid_for_node }}'
+        export PATH="$ORACLE_HOME/bin:$PATH"
+        if ! pgrep -f "[a]sm_pmon" >/dev/null 2>&1; then
+          echo "ERROR: No ASM process (asm_pmon). Grid stack is not running." >&2
+          echo "Fix: ensure Grid/ASM is configured and running; crsctl stat res -t should show ora.cssd and ora.asm ONLINE." >&2
+          exit 1
+        fi
+        sqlplus -s "/ as sysasm" <<'EOSQL'
+        WHENEVER SQLERROR EXIT SQL.SQLCODE
+        SET HEADING OFF FEEDBACK OFF VERIFY OFF ECHO OFF PAGESIZE 0
+        SELECT 'ASM_SYSASM_OK' FROM dual;
+        EXIT;
+        EOSQL
+        EOSCRIPT
+      args:
+        executable: /bin/bash
+      become: true
+      register: asm_preflight
+      changed_when: false
+
+    # Only loop over DGs we actually create — skipping CRS items in-loop yields result rows with no rc and breaks conditionals.
+    - name: Build list of non-CRS ASM disk groups to create
+      ansible.builtin.set_fact:
+        _asm_dgs_to_create: >-
+          {{
+            asm_diskgroups | default([])
+            | rejectattr('used_for_grid_crs', 'equalto', true)
+            | selectattr('disks', 'defined')
+            | rejectattr('disks', 'equalto', [])
+            | list
+          }}
+
+    # Looped task: register asm_dg_create.results[] per DG; failed_when/changed_when must use rc/stdout/stderr (per iteration).
+    - name: Create configured ASM disk groups (sqlplus as SYSASM, primary node)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        # Quoted <<'EOSCRIPT' so the parent bash (set -u) does not expand $ORACLE_HOME/$PATH while building the heredoc.
+        runuser -u "{{ grid_user }}" -- env DG_NAME={{ dg.name | quote }} /bin/bash <<'EOSCRIPT'
+        set -euo pipefail
+        export ORACLE_HOME="{{ grid_home }}"
+        export ORACLE_SID='{{ asm_instance_sid_for_node }}'
+        export PATH="$ORACLE_HOME/bin:$PATH"
+        TMP=$(mktemp)
+        trap 'rm -f "$TMP"' EXIT
+        set +e
+        sqlplus -s "/ as sysasm" <<'EOSQL' >"$TMP" 2>&1
+        SET HEADING OFF FEEDBACK OFF VERIFY OFF ECHO OFF PAGESIZE 0
+        WHENEVER SQLERROR EXIT SQL.SQLCODE
+        CREATE DISKGROUP {{ dg.name }} {{ dg.redundancy | default('EXTERNAL') }} REDUNDANCY
+        {% for d in dg.disks %}
+        DISK '{{ d }}' NAME {{ dg.name | lower }}_{{ '%04d' | format(loop.index0) }}{{ ',' if not loop.last else '' }}
+        {% endfor %}
+        ;
+        EXIT;
+        EOSQL
+        RC=$?
+        set -e
+        cat "$TMP"
+        # ORA-15033 on the error line only (not CREATE line): disk already in this DG → success for idempotent re-run.
+        if [ "$RC" -ne 0 ] && grep -q 'ORA-15033' "$TMP"; then
+          ORA_LINE=$(grep 'ORA-15033' "$TMP" | head -1 || true)
+          OWN=$(printf '%s' "$DG_NAME" | tr '[:lower:]' '[:upper:]')
+          ORA_UP=$(printf '%s' "$ORA_LINE" | tr '[:lower:]' '[:upper:]')
+          case "$ORA_UP" in
+            *DISKGROUP*\"$OWN\"*) exit 0 ;;
+            *DISKGROUP*\'$OWN\') exit 0 ;;
+          esac
+        fi
+        exit "$RC"
+        EOSCRIPT
+      args:
+        executable: /bin/bash
+      become: true
+      register: asm_dg_create
+      loop: "{{ _asm_dgs_to_create | default([]) }}"
+      loop_control:
+        loop_var: dg
+        label: "{{ dg.name }}"
+      # Looped shell: failed_when on rc/stdout is unreliable on some ansible-core builds — assert after loop instead.
+      changed_when: false
+      failed_when: false
+
+    - name: Assert each CREATE DISKGROUP finished successfully (rc 0 after idempotent ORA-15033 handling)
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - item.rc | default(-1) | int == 0
+        fail_msg: >-
+          CREATE DISKGROUP failed for {{ item.dg.name | default(item.item.name | default('(unknown)')) }} (rc={{ item.rc | default('?') }}).
+          See stdout in the previous task. ORA-15033 for the same DG name is normalized to rc=0 in the shell script.
+      loop: "{{ asm_dg_create.results | default([]) }}"
+      loop_control:
+        label: "{{ item.dg.name | default(item.item.name | default('?')) }}"
+      when:
+        - asm_dg_create is defined
+        - asm_dg_create.results is defined
+
+  rescue:
+    - name: Fail after step 15 with sqlplus / preflight detail
+      ansible.builtin.fail:
+        msg: |-
+          Step 15 (CREATE DISKGROUP) failed. Common causes: Grid/ASM down (ora.cssd/ora.asm OFFLINE), bad disk paths, disk in another DG.
+
+          {% if asm_preflight is defined %}
+          --- ASM preflight rc={{ asm_preflight.rc | default('?') }} ---
+          stdout:
+          {{ asm_preflight.stdout | default('') }}
+          stderr:
+          {{ asm_preflight.stderr | default('') }}
+          {% endif %}
+
+          {% if asm_dg_create is defined and asm_dg_create.results is defined %}
+          {% for r in asm_dg_create.results %}
+          --- diskgroup: {{ r.dg.name | default(r.item.name | default('(unknown)')) }}  skipped={{ r.skipped | default(false) }}  rc={{ r.rc | default('(none)') }} ---
+          {% if r.skipped | default(false) %}
+          skip_reason: {{ r.skip_reason | default('') }}
+          {% endif %}
+          {% if r.msg is defined %}
+          msg: {{ r.msg }}
+          {% endif %}
+          stdout:
+          {{ r.stdout | default('') }}
+          stderr:
+          {{ r.stderr | default('') }}
+          {% endfor %}
+          {% elif asm_dg_create is defined %}
+          --- single result rc={{ asm_dg_create.rc | default('?') }} ---
+          stdout:
+          {{ asm_dg_create.stdout | default('') }}
+          stderr:
+          {{ asm_dg_create.stderr | default('') }}
+          {% endif %}
+
+- name: Mount all configured ASM disk groups on all nodes
+  ansible.builtin.import_tasks: mount_asm_diskgroups.yml

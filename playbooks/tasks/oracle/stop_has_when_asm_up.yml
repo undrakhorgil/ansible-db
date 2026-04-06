@@ -1,0 +1,167 @@
+---
+# crsctl / systemd first; then optional kill. Never pgrep -f asm_pmon (matches this bash -c).
+# asm_pids via /proc: ps output often omits or reformats +ASM; OHASD respawns pmon — kill ohasd.bin then ASM oracle PIDs.
+- name: Stop HAS / OHASD when asm_pmon is running
+  ansible.builtin.shell: |
+    set -uo pipefail
+    _is_oracle_exe() {
+      local x
+      x=$(readlink -f "$1" 2>/dev/null || true)
+      [[ "$x" == */bin/oracle ]] || [[ "$x" == */bin/oracle.bin ]]
+    }
+    asm_pids() {
+      local p i cl exe
+      for p in /proc/[0-9]*; do
+        i=${p#/proc/}
+        [[ "$i" =~ ^[0-9]+$ ]] || continue
+        (( 10#$i == $$ )) && continue
+        [ -r "$p/cmdline" ] || continue
+        [ -r "$p/exe" ] || continue
+        _is_oracle_exe "$p/exe" || continue
+        cl=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null || true)
+        [[ "$cl" == *asm_pmon* ]] || continue
+        [[ "$cl" == *ASM* ]] || continue
+        printf '%s\n' "$i"
+      done
+    }
+    ohasd_pids() {
+      local p i cl
+      for p in /proc/[0-9]*; do
+        i=${p#/proc/}
+        [[ "$i" =~ ^[0-9]+$ ]] || continue
+        (( 10#$i == $$ )) && continue
+        [ -r "$p/cmdline" ] || continue
+        cl=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null || true)
+        [[ "$cl" == *ohasd.bin* ]] || continue
+        printf '%s\n' "$i"
+      done
+    }
+    asm_up() { asm_pids | grep -q '[0-9]'; }
+    asm_up || exit 0
+
+    CRS=""
+    GH_CRS="{{ grid_home }}/bin/crsctl"
+    if [ -x "$GH_CRS" ]; then CRS="$GH_CRS"; fi
+
+    if [ -z "$CRS" ]; then
+      for pid in $(asm_pids); do
+        [ -r "/proc/$pid/environ" ] || continue
+        OH=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -a '^ORACLE_HOME=' 2>/dev/null | head -1 | cut -d= -f2-)
+        if [ -n "$OH" ] && [ -x "$OH/bin/crsctl" ]; then
+          CRS="$OH/bin/crsctl"
+          break
+        fi
+      done
+    fi
+
+    if [ -z "$CRS" ]; then
+      for pid in $(asm_pids); do
+        [ -r "/proc/$pid/cmdline" ] || continue
+        arg0=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | head -1)
+        case "$arg0" in
+          */bin/oracle.bin) OH="${arg0%/bin/oracle.bin}" ;;
+          */bin/oracle)     OH="${arg0%/bin/oracle}" ;;
+          *)                continue ;;
+        esac
+        if [ -x "$OH/bin/crsctl" ]; then
+          CRS="$OH/bin/crsctl"
+          break
+        fi
+      done
+    fi
+
+    if [ -z "$CRS" ]; then
+      for pid in $(asm_pids); do
+        [ -r "/proc/$pid/exe" ] || continue
+        exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+        [ -z "$exe" ] && continue
+        c="${exe%/*}/crsctl"
+        if [ -x "$c" ]; then
+          CRS="$c"
+          break
+        fi
+      done
+    fi
+
+    if [ -z "$CRS" ] && command -v crsctl >/dev/null 2>&1; then
+      c=$(command -v crsctl)
+      [ -x "$c" ] && CRS="$c"
+    fi
+
+    if [ -z "$CRS" ] && [ -d /u01 ]; then
+      c=$(find /u01 -maxdepth 10 -path '*/bin/crsctl' -type f -executable 2>/dev/null | head -1)
+      [ -n "$c" ] && [ -x "$c" ] && CRS="$c"
+    fi
+
+    if [ -n "$CRS" ]; then
+      echo "Stopping HAS via $CRS"
+      $CRS stop has </dev/null || $CRS stop has -f </dev/null || true
+    else
+      echo "crsctl not resolved — trying init.ohasd and systemd" >&2
+    fi
+
+    for init in /etc/init.d/init.ohasd /etc/init.d/ohasd; do
+      [ -x "$init" ] || continue
+      "$init" stop 2>/dev/null || true
+    done
+
+    if command -v systemctl >/dev/null 2>&1; then
+      for svc in oracle-ohasd ohasd oracleohasd; do
+        systemctl stop "${svc}.service" 2>/dev/null || true
+      done
+      while read -r u; do
+        [ -z "$u" ] && continue
+        systemctl stop "$u" 2>/dev/null || true
+      done < <(systemctl list-units --type=service --state=running --no-pager 2>/dev/null | grep -i ohasd | awk '{print $1}' | grep '\.service$')
+    fi
+
+    set -e
+    for i in $(seq 1 90); do
+      asm_up || { echo "asm_pmon stopped"; exit 0; }
+      sleep 2
+    done
+
+    if [ "${ASM_FORCE_KILL:-0}" != 1 ]; then
+      echo "asm_pmon still running after ~3m — set asm_force_kill_asm_pmon_after_stop: true or stop HAS manually." >&2
+      exit 1
+    fi
+
+    set +e
+    echo "ASM_FORCE_KILL: SIGTERM ohasd.bin PIDs (stops respawn)" >&2
+    for pid in $(ohasd_pids); do
+      [ -z "$pid" ] && continue
+      kill -TERM "$pid" 2>/dev/null || true
+    done
+    sleep 10
+    echo "ASM_FORCE_KILL: SIGKILL ohasd.bin PIDs" >&2
+    for pid in $(ohasd_pids); do
+      [ -z "$pid" ] && continue
+      kill -KILL "$pid" 2>/dev/null || true
+    done
+    sleep 8
+
+    echo "ASM_FORCE_KILL: SIGTERM ASM oracle (asm_pmon) PIDs" >&2
+    for pid in $(asm_pids); do
+      [ -z "$pid" ] && continue
+      kill -TERM "$pid" 2>/dev/null || true
+    done
+    sleep 15
+    if ! asm_up; then echo "asm_pmon stopped after ohasd + SIGTERM"; exit 0; fi
+
+    echo "ASM_FORCE_KILL: SIGKILL ASM oracle (asm_pmon) PIDs" >&2
+    for pid in $(asm_pids); do
+      [ -z "$pid" ] && continue
+      kill -KILL "$pid" 2>/dev/null || true
+    done
+    sleep 8
+
+    set -e
+    asm_up || { echo "asm_pmon stopped"; exit 0; }
+    echo "asm_pmon still running after ohasd + SIGKILL — manual intervention required." >&2
+    exit 1
+  args:
+    executable: /bin/bash
+  environment:
+    ASM_FORCE_KILL: "{{ '1' if asm_force_kill_asm_pmon_after_stop | default(true) | bool else '0' }}"
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+  become: true

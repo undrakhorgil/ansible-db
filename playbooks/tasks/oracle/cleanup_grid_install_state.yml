@@ -1,0 +1,92 @@
+---
+# Shared teardown: central inventory + /etc/oracle so gridSetup / CVU can run again after undo.
+# Safe to run when Grid is down (undo 7 / 4). Run on the managed host for /etc/oracle.
+
+- name: Remove stale Grid install session response files only (never rm -rf install/)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    GH="{{ grid_home }}"
+    [ -d "$GH" ] || exit 0
+    # install/ contains shipped OUI jars/classes (e.g. InstallerPatchDriver). Deleting the whole
+    # directory causes ClassNotFoundException. Only drop per-session grid_*.rsp files.
+    if [ -d "$GH/install/response" ]; then
+      rm -f "$GH/install/response"/grid_*.rsp 2>/dev/null || true
+    fi
+  args:
+    executable: /bin/bash
+  become: true
+  become_user: root
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+  failed_when: false
+  changed_when: true
+
+- name: Strip GRID_HOME from central inventory.xml (if inventory exists)
+  ansible.builtin.shell: |
+    set -e
+    GH="{{ grid_home }}"
+    INV_XML="{{ oracle_inventory }}/ContentsXML/inventory.xml"
+    [ -f "$INV_XML" ] || exit 0
+    # Force fresh central inventory metadata rebuild.
+    # If inventory.xml is stale/corrupted/inconsistent, gridSetup may resolve GI home as ().
+    rm -rf "{{ oracle_inventory }}/ContentsXML" 2>/dev/null || true
+    mkdir -p "{{ oracle_inventory }}/ContentsXML" 2>/dev/null || true
+    chmod 0755 "{{ oracle_inventory }}/ContentsXML" 2>/dev/null || true
+    chown -R grid:oinstall "{{ oracle_inventory }}/ContentsXML" 2>/dev/null || true
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+  failed_when: false
+  changed_when: true
+
+- name: Remove stale Grid local metadata under /etc/oracle
+  ansible.builtin.shell: |
+    set -e
+    GH="{{ grid_home }}"
+    # Force OUI to rebuild inventory pointers from response file / new install.
+    rm -f /etc/oraInst.loc /etc/oracle/oraInst.loc /etc/oratab 2>/dev/null || true
+    # Strong cleanup: remove any remaining Oracle locator metadata under /etc/oracle.
+    # In this lab workflow, this is required to avoid INS-30024 stale home detection.
+    if [ -d /etc/oracle ]; then
+      rm -rf /etc/oracle/* 2>/dev/null || true
+    fi
+    mkdir -p /etc/oracle
+    rm -f /etc/oracle/olr.loc || true
+    if [ -f /etc/oracle/ocr.loc ] && grep -Fq "$GH" /etc/oracle/ocr.loc 2>/dev/null; then
+      rm -f /etc/oracle/ocr.loc || true
+    fi
+    rm -rf /etc/oracle/scls_scr /etc/oracle/chkconfig 2>/dev/null || true
+    rm -f /etc/oracle/setPassword.sh 2>/dev/null || true
+    if [ -d /etc/oracle ]; then
+      while IFS= read -r f; do
+        [ -f "$f" ] || continue
+        grep -Fq "$GH" "$f" 2>/dev/null || continue
+        sed -i.bak "\|${GH}|d" "$f" || true
+      done < <(find /etc/oracle -type f 2>/dev/null || true)
+    fi
+  args:
+    executable: /bin/bash
+  failed_when: false
+  changed_when: true
+
+- name: Drop oraInst.loc if inventory path is missing or empty (local node)
+  ansible.builtin.shell: |
+    exit 0
+  args:
+    executable: /bin/bash
+  failed_when: false
+  changed_when: false
+
+- name: Recreate oraInst.loc for gridSetup inventory resolution
+  ansible.builtin.copy:
+    dest: "{{ item.dest }}"
+    content: |
+      inventory_loc={{ oracle_inventory }}
+      inst_group={{ oinstall_group }}
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { dest: "/etc/oraInst.loc" }
+    - { dest: "/etc/oracle/oraInst.loc" }
+  failed_when: false
+  changed_when: true

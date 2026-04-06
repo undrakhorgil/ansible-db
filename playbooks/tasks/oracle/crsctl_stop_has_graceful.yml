@@ -1,0 +1,15 @@
+---
+# Best-effort HAS stop before Grid metadata cleanup (undo 7+). No asm_pmon SIGKILL — use stop_has_when_asm_up for that.
+- name: crsctl stop has if crsctl exists (graceful)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    CRS="{{ grid_home }}/bin/crsctl"
+    [ -x "$CRS" ] || exit 0
+    $CRS stop has </dev/null || $CRS stop has -f </dev/null || true
+    exit 0
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+  become: true
+  failed_when: false
+  changed_when: true

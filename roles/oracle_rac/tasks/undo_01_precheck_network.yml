@@ -1,4 +1,0 @@
----
-- name: Undo 01 (no-op)
-  ansible.builtin.debug:
-    msg: "Precheck only."

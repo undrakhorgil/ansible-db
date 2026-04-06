@@ -1,5 +1,0 @@
----
-- name: Undo 13 no-op
-  ansible.builtin.debug:
-    msg: "Grid postcheck discover only."
-

@@ -1,7 +1,0 @@
----
-- name: Undo 06 remove ASM udev rules
-  ansible.builtin.file:
-    path: /etc/udev/rules.d/99-oracle-asmdevices.rules
-    state: absent
-  failed_when: false
-  changed_when: false

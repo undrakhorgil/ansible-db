@@ -1,0 +1,28 @@
+---
+# Optional GI root deconfiguration (Oracle-supported rollback). Default off — destructive and version-specific.
+- name: Undo 08 optional GI root deconfiguration (rootcrs.sh)
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - oracle_undo_08_rootcrs_deconfig | default(false) | bool
+  block:
+    - name: Undo 08 run rootcrs.sh -deconfig -force when present
+      ansible.builtin.shell: |
+        set -euo pipefail
+        R="{{ grid_home }}/crs/install/rootcrs.sh"
+        [ -x "$R" ] || R="{{ grid_home }}/crs/install/rootcrs.pl"
+        [ -x "$R" ] || { echo "no rootcrs under {{ grid_home }}/crs/install"; exit 0; }
+        "$R" -deconfig -force </dev/null || true
+      args:
+        executable: /bin/bash
+      become: true
+      failed_when: false
+      changed_when: true
+
+- name: Undo 08 note when rootcrs deconfig not requested
+  ansible.builtin.debug:
+    msg: >-
+      Undo 08: rootcrs not run (oracle_undo_08_rootcrs_deconfig is false). Set it true for rootcrs.sh -deconfig -force,
+      or follow Oracle Grid deinstall for your release.
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - not (oracle_undo_08_rootcrs_deconfig | default(false) | bool)

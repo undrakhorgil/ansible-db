@@ -1,5 +1,0 @@
----
-- name: Undo 02 remove preinstall package
-  ansible.builtin.shell: "dnf -y remove {{ oracle_preinstall_package }} || true"
-  changed_when: false
-  failed_when: false

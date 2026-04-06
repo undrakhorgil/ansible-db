@@ -1,6 +1,0 @@
----
-- name: Undo 05 remove hosts block
-  ansible.builtin.blockinfile:
-    path: /etc/hosts
-    marker: "# {mark} ANSIBLE RAC HOSTS"
-    state: absent

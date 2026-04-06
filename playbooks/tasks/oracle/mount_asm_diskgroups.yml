@@ -1,0 +1,35 @@
+---
+# Requires asm_instance_sid_for_node (import asm_sid_facts.yml first).
+# Per-DG MOUNT — ALL MOUNT fails if any DG is already mounted (ORA-15032/15013).
+# Root runs the module (writable ansible_remote_tmp); sqlplus runs as grid (same as 16_create_orcl_database.yml).
+- name: Mount ASM disk group on every cluster node
+  ansible.builtin.shell: |
+    set -euo pipefail
+    runuser -u "{{ grid_user }}" -- /bin/bash <<'EOSCRIPT'
+    set -euo pipefail
+    export ORACLE_HOME="{{ grid_home }}"
+    export ORACLE_SID='{{ asm_instance_sid_for_node }}'
+    export PATH="$ORACLE_HOME/bin:$PATH"
+    sqlplus -s "/ as sysasm" <<'EOSQL'
+    SET HEADING OFF FEEDBACK OFF VERIFY OFF ECHO OFF PAGESIZE 0
+    WHENEVER SQLERROR EXIT SQL.SQLCODE
+    ALTER DISKGROUP {{ dg.name }} MOUNT;
+    EXIT;
+    EOSQL
+    EOSCRIPT
+  args:
+    executable: /bin/bash
+  become: true
+  register: asm_dg_mount_one
+  loop: "{{ asm_diskgroups | default([]) }}"
+  loop_control:
+    loop_var: dg
+    label: "{{ dg.name }}"
+  changed_when: >-
+    asm_dg_mount_one.rc == 0
+    and ('ORA-15013' not in (asm_dg_mount_one.stdout | default('') + asm_dg_mount_one.stderr | default('')))
+  failed_when: >-
+    asm_dg_mount_one.rc | int != 0
+    and ('ORA-15013' not in (asm_dg_mount_one.stdout | default('') + asm_dg_mount_one.stderr | default('')))
+  when:
+    - (asm_diskgroups | default([]) | length) > 0

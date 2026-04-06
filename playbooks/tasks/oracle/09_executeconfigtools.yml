@@ -1,0 +1,129 @@
+---
+# Step 9: finish GI configuration (executeConfigTools) for standalone server install.
+#
+# /etc/oracle/olr.loc is not a reliable gate (stale installs or partial state). Oracle will
+# refuse executeConfigTools until {{ grid_home }}/root.sh has completed successfully.
+
+- name: Run GI executeConfigTools (finish CRS config)
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+  block:
+    # Root runs the module (ansible_remote_tmp); gridSetup runs as grid (same as step 07).
+    - name: Execute gridSetup.sh -executeConfigTools using latest session response file
+      ansible.builtin.shell: |
+        set -euo pipefail
+        runuser -u "{{ grid_user }}" -- /bin/bash <<'EOSCRIPT'
+        set -euo pipefail
+        export HOME="/home/{{ grid_user }}"
+        export ORACLE_HOME="{{ grid_home }}"
+        export GRID_HOME="{{ grid_home }}"
+        export ORACLE_BASE="{{ oracle_base }}"
+        export ORACLE_HOSTNAME="{{ oracle_grid_hostname | default(ansible_hostname, true) }}"
+        export DISPLAY=""
+        export PATH="{{ grid_home }}/bin:${PATH:-}"
+        GS="{{ grid_home }}/gridSetup.sh"
+        [ -x "$GS" ] || { echo "Missing gridSetup.sh under {{ grid_home }}"; exit 1; }
+
+        RSP_FILE="{{ oracle_grid_session_rsp | default('') }}"
+        if [ -z "$RSP_FILE" ] || [ ! -f "$RSP_FILE" ]; then
+          RSP_FILE="$(ls -1t "{{ grid_home }}/install/response"/grid_*.rsp 2>/dev/null | head -n1 || true)"
+        fi
+        if [ -z "$RSP_FILE" ]; then
+          RSP_FILE="$(ls -1t "{{ grid_home }}/response"/grid_*.rsp 2>/dev/null | head -n1 || true)"
+        fi
+        if [ -z "$RSP_FILE" ]; then
+          echo "No session grid_*.rsp found under {{ grid_home }}. Re-run step 07 (gridSetup) first." >&2
+          exit 1
+        fi
+
+        cd "{{ grid_home }}"
+        echo "executeConfigTools using responseFile: $RSP_FILE pwd=$(pwd)"
+        exec /bin/bash "$GS" -silent -ignorePrereqFailure -executeConfigTools -responseFile "$RSP_FILE" </dev/null
+        EOSCRIPT
+      args:
+        executable: /bin/bash
+      become: true
+      register: gi_exec_cfg
+      failed_when: false
+      changed_when: false
+
+    - name: Detect executeConfigTools blocked on pending root.sh
+      ansible.builtin.set_fact:
+        gi_exec_needs_root: >-
+          {{ (gi_exec_cfg.rc | default(-1) | int != 0) and (
+          ('root.sh' in (gi_exec_cfg.stdout | default('')))
+          or ('privileged user' in (gi_exec_cfg.stdout | default('')))
+          or (('privileged' in (gi_exec_cfg.stdout | default(''))) and ('not completed' in (gi_exec_cfg.stdout | default(''))))
+          ) }}
+
+    - name: Run GI root.sh (step 8) then retry executeConfigTools once
+      when: gi_exec_needs_root | bool
+      block:
+        - name: Run step 08 (root.sh) before executeConfigTools can proceed
+          ansible.builtin.import_tasks: 08_grid_rootsh.yml
+
+        - name: Retry gridSetup.sh -executeConfigTools after root.sh
+          ansible.builtin.shell: |
+            set -euo pipefail
+            runuser -u "{{ grid_user }}" -- /bin/bash <<'EOSCRIPT'
+            set -euo pipefail
+            export HOME="/home/{{ grid_user }}"
+            export ORACLE_HOME="{{ grid_home }}"
+            export GRID_HOME="{{ grid_home }}"
+            export ORACLE_BASE="{{ oracle_base }}"
+            export ORACLE_HOSTNAME="{{ oracle_grid_hostname | default(ansible_hostname, true) }}"
+            export DISPLAY=""
+            export PATH="{{ grid_home }}/bin:${PATH:-}"
+            GS="{{ grid_home }}/gridSetup.sh"
+            RSP_FILE="{{ oracle_grid_session_rsp | default('') }}"
+            if [ -z "$RSP_FILE" ] || [ ! -f "$RSP_FILE" ]; then
+              RSP_FILE="$(ls -1t "{{ grid_home }}/install/response"/grid_*.rsp 2>/dev/null | head -n1 || true)"
+            fi
+            if [ -z "$RSP_FILE" ]; then
+              RSP_FILE="$(ls -1t "{{ grid_home }}/response"/grid_*.rsp 2>/dev/null | head -n1 || true)"
+            fi
+            if [ -z "$RSP_FILE" ]; then
+              echo "No session grid_*.rsp found under {{ grid_home }}." >&2
+              exit 1
+            fi
+            cd "{{ grid_home }}"
+            echo "executeConfigTools (retry) using responseFile: $RSP_FILE pwd=$(pwd)"
+            exec /bin/bash "$GS" -silent -ignorePrereqFailure -executeConfigTools -responseFile "$RSP_FILE" </dev/null
+            EOSCRIPT
+          args:
+            executable: /bin/bash
+          become: true
+          register: gi_exec_cfg_retry
+          failed_when: gi_exec_cfg_retry.rc | default(-1) | int != 0
+          changed_when: false
+
+    - name: Fail if executeConfigTools did not complete successfully
+      ansible.builtin.fail:
+        msg: |-
+          gridSetup.sh -executeConfigTools failed.
+
+          First attempt rc={{ gi_exec_cfg.rc | default('?') }}; needs_root={{ gi_exec_needs_root | default(false) }}
+          {% if gi_exec_cfg_retry is defined %}
+          Retry rc={{ gi_exec_cfg_retry.rc | default('?') }}
+          {% endif %}
+
+          --- stdout (first attempt, last 80 lines) ---
+          {{ (gi_exec_cfg.stdout | default('') | split('\n'))[-80:] | join('\n') }}
+
+          {% if gi_exec_cfg_retry is defined %}
+          --- stdout (retry, last 80 lines) ---
+          {{ (gi_exec_cfg_retry.stdout | default('') | split('\n'))[-80:] | join('\n') }}
+          {% endif %}
+
+          Logs: {{ grid_home }}/cfgtoollogs/ and {{ oracle_inventory }}/logs/
+
+          If Oracle names a node (e.g. [host03]) but root.sh already ran, ensure the OS hostname matches that node
+          (hostname / hostname -f) or set oracle_grid_hostname in group_vars to that short name and re-run steps 8–9.
+      when: >-
+        not (
+        (gi_exec_cfg.rc | default(-1) | int == 0)
+        or (
+        (gi_exec_needs_root | default(false) | bool)
+        and (gi_exec_cfg_retry is defined)
+        and (gi_exec_cfg_retry.rc | default(-1) | int == 0)
+        )
+        )

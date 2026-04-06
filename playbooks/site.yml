@@ -1,12 +1,14 @@
 ---
-- import_playbook: bootstrap_rac_inventory.yml
+- import_playbook: bootstrap_inventory.yml
 - import_playbook: prep_remote.yml
 
 - name: Full run
-  hosts: oracle_rac_servers
+  hosts: oracle_managed_hosts
   gather_facts: false
   become: true
   any_errors_fatal: true
+  vars_files:
+    - vars/oracle_defaults.yml
   vars:
     ansible_user: root
     ansible_password: "{{ target_root_password }}"
@@ -14,5 +16,5 @@
     ansible_ssh_common_args: >-
       {{ '' if (oracle_ssh_strict_host_key_checking | default(true) | bool)
          else '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' }}
-  roles:
-    - role: oracle_rac
+  tasks:
+    - ansible.builtin.import_tasks: tasks/oracle/main.yml

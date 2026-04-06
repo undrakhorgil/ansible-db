@@ -1,0 +1,4 @@
+---
+- name: Undo 10 note — postcheck had no persistent host changes
+  ansible.builtin.debug:
+    msg: "Undo 10: forward step is verification only; nothing to revert on the host."

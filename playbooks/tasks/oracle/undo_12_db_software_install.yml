@@ -1,0 +1,5 @@
+---
+# Undo 12: DB software-only install rollback handled by DB deinstall
+- name: Undo 12 include DB deinstall tasks
+  ansible.builtin.import_tasks: undo_db_software_install_deinstall.yml
+

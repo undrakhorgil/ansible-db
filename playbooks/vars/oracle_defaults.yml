@@ -1,0 +1,79 @@
+---
+# Optional OS ids (set in group_vars only on a clean host before Grid/DB run). Pinning UID/GID triggers usermod; Linux
+# refuses that while the user has running processes (ORA-*, crsctl, etc.). Leave unset to only ensure users exist + chown paths.
+# Example greenfield: oinstall_gid: 54321  oracle_user_uid: 54321  grid_user_uid: 54322
+# Step 4: chown -R oracle:oinstall under ORACLE_BASE (set false if you store non-oracle files there).
+oracle_recurse_chown_oracle_base: true
+
+# rac_primary_node is set in 00_topology to the target's ansible_hostname (real OS hostname).
+rac_primary_node: ""
+
+# Optional: override auto-derived cluster short name used by installers (default = ansible_hostname uppercased in 00_topology).
+oracle_cluster_name: ""
+
+# Interconnect: false = single public NIC (Oracle Restart default). Set true only if you added private_ip + oracle_private_subnet on the host.
+oracle_use_private_network: false
+oracle_private_subnet: ""
+
+# Grid networkInterfaceList third field (numeric OUI role). Used only when oracle_use_private_network is true.
+oracle_grid_iface_role_public: "1"
+oracle_grid_iface_role_private: "5"
+
+# Empty = discover NICs from host_ip (and private_ip if used). Set to full `eth0:192.168.1.0:1,...` to skip discovery.
+oracle_grid_network_interface_list: ""
+
+# gridSetup.sh can run a long time with little output; async avoids a “stuck” Ansible task (override in group_vars if needed).
+oracle_grid_setup_async_seconds: 14400
+oracle_grid_setup_poll_seconds: 30
+
+# Optional: GI/OUI node name (must match `hostname` / what Grid registered, e.g. host03). Empty = ansible_hostname.
+oracle_grid_hostname: ""
+
+# Before DBCA, ALTER DISKGROUP ... SET ATTRIBUTE 'compatible.rdbms' on DATA/FRA DGs. Low values cause
+# "Recovery Manager failed to restore datafiles" during dbca. Empty string skips ALTER.
+# Use five-part values (e.g. 23.0.0.0.0) — ASM often rejects or mis-handles four-part; must be <= compatible.asm on each DG.
+oracle_database_compatible_rdbms: "23.0.0.0.0"
+
+# chmod 6751 on $ORACLE_HOME/bin/oracle before DBCA (common fix for RMAN/ASM restore during seed clone).
+dbca_oracle_binary_setuid: true
+# dbca_pass_init_params — do not define here; vars_files would override group_vars. Default false via | default(false) in task.
+# Set true in group_vars to add -initParams (db_create_file_dest, db_recovery_file_dest, size) for RMAN clone on ASM.
+
+# DBCA -databaseConfigType (Oracle doc: SINGLE | RAC | RACONENODE | SEHA). EE on Oracle Restart: usually SINGLE.
+dbca_database_config_type: "SINGLE"
+# ASM clone: OMF is recommended; helps some RMAN restore paths during seed clone.
+dbca_use_omf: true
+# Set to 1 if RMAN/ASM channel races during clone; empty = omit -rmanParallelism (DBCA default).
+dbca_rman_parallelism: 1
+
+# Step 16: dbca_enforce_oracle_home_path_matches_oraversion — do NOT define here; play vars_files override
+# group_vars and would ignore your group_vars/all.yml. Default is true via Jinja default() in the task; set false in
+# group_vars when 23c software lives under a …/product/26…/ path. Full bypass: dbca_skip_db_home_inventory_mismatch_check.
+
+# Step 5: zero partition headers for CANDIDATE disks. If ASM is running, wipe is refused unless true (expert / risky).
+asm_wipe_stale_headers: true
+asm_wipe_header_mb: 100
+asm_allow_wipe_while_asm_running: false
+# Step 7: crsctl stop has when asm_pmon is running so header wipe runs and gridSetup can create CRS DG (avoids INS-30516/30530).
+asm_stop_has_before_gridsetup_wipe: true
+# If crsctl/systemd cannot stop +ASM (~3m), send SIGTERM/SIGKILL to asm_pmon PIDs (lab; false on shared production hosts).
+asm_force_kill_asm_pmon_after_stop: true
+
+# Undo 16: if CRS has no database config (e.g. failed DBCA) but spfile/init exists, try SQL*Plus DROP DATABASE INCLUDING DATAFILES.
+undo_16_sqlplus_drop_without_crs: true
+# Extra top-level ASM directory names under +DATA/+FRA to remove (beyond dbca_gdbname and dbca_sid).
+undo_16_asm_extra_subtrees: []
+# Remove {{ oracle_base }}/fast_recovery_area/{{ dbca_sid }} if present.
+undo_16_clean_fast_recovery_area: true
+
+# --- Undo behaviour (oradbctl -u <n>) — many forward steps cannot be fully reversed without Oracle deinstall tools.
+# Stop HAS before clearing /etc/oracle (undo 7); set false only if stack is already down.
+oracle_undo_07_stop_has: true
+# Run $GRID_HOME/crs/install/rootcrs.sh -deconfig -force as root (destructive; false by default).
+oracle_undo_08_rootcrs_deconfig: false
+# With oracle_undo_remove_user_homes: true, user module removes home dirs (only after Grid/DB are fully down).
+oracle_undo_remove_user_homes: false
+# Undo 17: delete control-host grid_environment_summary.html when true.
+oracle_undo_17_delete_local_summary: true
+# Undo 02: re-enable firewalld after undo (step 2 disabled it); false by default.
+oracle_undo_02_restore_firewalld: false

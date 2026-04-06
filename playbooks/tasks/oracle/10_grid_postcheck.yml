@@ -1,0 +1,59 @@
+---
+# Step 10: basic post-install checks for Oracle Restart (standalone server GI).
+
+- name: Run crsctl check has (Oracle Restart)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    export ORACLE_HOME="{{ grid_home }}"
+    export GRID_HOME="{{ grid_home }}"
+    export PATH="{{ grid_home }}/bin:${PATH:-}"
+    crsctl check has
+  args:
+    executable: /bin/bash
+  become: true
+  become_user: root
+  register: crsctl_check_has
+  changed_when: false
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+- name: Run crsctl stat res -t
+  ansible.builtin.shell: |
+    set -euo pipefail
+    export ORACLE_HOME="{{ grid_home }}"
+    export GRID_HOME="{{ grid_home }}"
+    export PATH="{{ grid_home }}/bin:${PATH:-}"
+    crsctl stat res -t
+  args:
+    executable: /bin/bash
+  become: true
+  become_user: "{{ grid_user }}"
+  register: crsctl_stat_res
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+- name: Run srvctl status asm
+  ansible.builtin.shell: |
+    set -euo pipefail
+    export ORACLE_HOME="{{ grid_home }}"
+    export GRID_HOME="{{ grid_home }}"
+    export PATH="{{ grid_home }}/bin:${PATH:-}"
+    srvctl status asm
+  args:
+    executable: /bin/bash
+  become: true
+  become_user: "{{ grid_user }}"
+  register: srvctl_status_asm
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+- name: Show GI postcheck outputs
+  ansible.builtin.debug:
+    msg:
+      - "crsctl check has: rc={{ crsctl_check_has.rc | default('?') }} stdout='{{ crsctl_check_has.stdout | default('') }}'"
+      - "crsctl stat res -t: rc={{ crsctl_stat_res.rc | default('?') }}"
+      - "{{ crsctl_stat_res.stdout | default('') }}"
+      - "srvctl status asm: rc={{ srvctl_status_asm.rc | default('?') }} stdout='{{ srvctl_status_asm.stdout | default('') }}'"
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+

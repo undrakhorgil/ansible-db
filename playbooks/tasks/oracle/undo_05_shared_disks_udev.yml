@@ -1,0 +1,24 @@
+---
+# Removes udev rules + tmpfiles.d entry from step 5 — does not delete partitions or zero ASM headers (see step 5 / manual dd).
+- name: Undo 05 remove ASM udev rules
+  ansible.builtin.file:
+    path: /etc/udev/rules.d/99-oracle-asmdevices.rules
+    state: absent
+  failed_when: false
+  changed_when: true
+
+- name: Undo 05 remove tmpfiles.d entry for /dev/oracleasm
+  ansible.builtin.file:
+    path: /etc/tmpfiles.d/oracle-asmdevices-dev.conf
+    state: absent
+  failed_when: false
+  changed_when: true
+
+- name: Undo 05 reload udev after removing ASM rules
+  ansible.builtin.command: "{{ item }}"
+  loop:
+    - /sbin/udevadm control --reload-rules
+    - /sbin/udevadm trigger --action=change
+    - /sbin/udevadm settle
+  changed_when: false
+  failed_when: false

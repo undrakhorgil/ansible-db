@@ -1,5 +1,0 @@
----
-# Step 12: executeConfigTools (wrapper around the split file)
-- name: Include executeConfigTools tasks
-  ansible.builtin.import_tasks: grid_executeconfigtools.yml
-

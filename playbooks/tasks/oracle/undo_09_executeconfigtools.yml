@@ -1,0 +1,6 @@
+---
+- name: Undo 09 note — executeConfigTools / clusterware state
+  ansible.builtin.debug:
+    msg: >-
+      Undo 09: executeConfigTools changes are not reversed in isolation. Stop HAS (undo 7), optionally rootcrs deconfig
+      (oracle_undo_08_rootcrs_deconfig), or use Oracle Grid deinstall for a full rollback.

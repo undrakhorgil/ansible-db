@@ -1,6 +1,0 @@
----
-# ASM instance name follows cluster node order: rac_nodes[0] -> +ASM1, rac_nodes[1] -> +ASM2, …
-# Keep rac_nodes order aligned with how Grid was installed. Import this before SYSASM sqlplus on a specific host.
-- name: Derive ASM instance SID for this cluster node
-  ansible.builtin.set_fact:
-    asm_instance_sid_for_node: "+ASM{{ (rac_nodes | map(attribute='name') | list).index(inventory_hostname) + 1 }}"

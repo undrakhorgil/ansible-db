@@ -4,4 +4,4 @@ all:
     localhost:
       ansible_connection: local
   children:
-    oracle_rac_servers: {}
+    oracle_managed_hosts: {}

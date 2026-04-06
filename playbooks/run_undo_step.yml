@@ -1,12 +1,14 @@
 ---
-- import_playbook: bootstrap_rac_inventory.yml
+- import_playbook: bootstrap_inventory.yml
 - import_playbook: prep_remote.yml
 
 - name: Run one undo step
-  hosts: oracle_rac_servers
+  hosts: oracle_managed_hosts
   gather_facts: false
   become: true
   any_errors_fatal: true
+  vars_files:
+    - vars/oracle_defaults.yml
   vars:
     ansible_user: root
     ansible_password: "{{ target_root_password }}"
@@ -15,13 +17,13 @@
          else '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' }}
     ansible_python_interpreter: /usr/bin/python3.11
   tasks:
-    - name: Validate rac_undo_step
+    - name: Validate oracle_undo_step
       ansible.builtin.assert:
         that:
-          - rac_undo_step is defined
-          - rac_undo_step | length > 0
+          - oracle_undo_step is defined
+          - oracle_undo_step | length > 0
         quiet: true
+    - name: Load topology from oracle_hosts
+      ansible.builtin.import_tasks: tasks/oracle/00_topology_from_oracle_hosts.yml
     - name: Run selected undo step
-      ansible.builtin.include_role:
-        name: oracle_rac
-        tasks_from: "{{ rac_undo_step }}"
+      ansible.builtin.include_tasks: tasks/oracle/{{ oracle_undo_step }}

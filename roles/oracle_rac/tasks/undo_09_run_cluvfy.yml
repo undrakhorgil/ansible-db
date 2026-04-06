@@ -1,5 +1,0 @@
----
-- name: Undo 09 — cluvfy is verification only
-  ansible.builtin.debug:
-    msg: "runcluvfy (step 9) performs checks only; nothing to undo."
-  when: inventory_hostname == rac_primary_node

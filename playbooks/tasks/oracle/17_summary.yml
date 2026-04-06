@@ -1,0 +1,47 @@
+---
+# Generate the report on the Ansible control host (this repo), not on the database server.
+# Output goes into the project root by default (one level above playbook_dir).
+- name: Set local summary output path (control host)
+  ansible.builtin.set_fact:
+    rac_summary_html_local_path: "{{ playbook_dir }}/../grid_environment_summary.html"
+  run_once: true
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+- name: Ensure local summary output directory exists (control host)
+  ansible.builtin.file:
+    path: "{{ rac_summary_html_local_path | dirname }}"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  run_once: true
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+- name: Gather minimal facts on control host for summary (ansible_date_time)
+  ansible.builtin.setup:
+    gather_subset:
+      - "!all"
+      - min
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  run_once: true
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+- name: Render Grid environment HTML summary (control host)
+  ansible.builtin.template:
+    src: grid_environment_summary.html.j2
+    dest: "{{ rac_summary_html_local_path }}"
+    mode: "0644"
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    oracle_managed_host_inventory: "{{ groups['oracle_managed_hosts'] | first }}"
+    summary_rac_primary_node: "{{ hostvars[groups['oracle_managed_hosts'] | first].rac_primary_node | default('') }}"
+    summary_rac_cluster_name: "{{ hostvars[groups['oracle_managed_hosts'] | first].rac_cluster_name | default('') }}"
+  run_once: true
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)

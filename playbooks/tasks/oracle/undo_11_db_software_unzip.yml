@@ -1,0 +1,14 @@
+---
+# Undo 11: clear DB home contents but keep the folder.
+- name: Undo 11 clear DB home contents (keep folder)
+  become: true
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if [ -d "{{ oracle_home }}" ]; then
+      find "{{ oracle_home }}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+    fi
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+  changed_when: true
+

@@ -1,0 +1,53 @@
+---
+# Last-chance zero of LUNs OUI will use (INS-30516 / INS-30530). Runs after gi_asm_disk_list exists; uses readlink -f
+# on the same paths as -diskList. OHASD may restart ASM mid-step — shared stop resolves crsctl if grid_home lacks it.
+- name: Stop HAS if ASM is still up before mandatory disk zero
+  ansible.builtin.import_tasks: stop_has_when_asm_up.yml
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - asm_wipe_stale_headers | default(true) | bool
+
+- name: Mandatory zero of headers on gridSetup disk paths (CRS + asm_disks + /dev/oracleasm)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    MB={{ asm_wipe_header_mb | default(256) | int }}
+    if [ "$MB" -lt 256 ]; then MB=256; fi
+    declare -A SEEN
+    wipe_one() {
+      local raw="$1"
+      raw="${raw#"${raw%%[![:space:]]*}"}"
+      raw="${raw%"${raw##*[![:space:]]}"}"
+      [ -n "$raw" ] || return 0
+      local p
+      p=$(readlink -f "$raw" 2>/dev/null || true)
+      if [ ! -b "$p" ]; then
+        echo "FATAL: not a block device: $raw -> $p" >&2
+        exit 1
+      fi
+      local k
+      k=$(stat -c '%d:%i' "$p")
+      [[ -n "${SEEN[$k]:-}" ]] && return 0
+      SEEN[$k]=1
+      echo "gridSetup mandatory wipe: $raw -> $p (${MB} MiB)"
+      dd if=/dev/zero of="$p" bs=1M count="$MB" conv=fsync
+    }
+    IFS=',' read -ra CRS <<< "{{ gi_asm_disk_list }}"
+    for x in "${CRS[@]}"; do wipe_one "$x"; done
+    {% for d in asm_disks | default([]) %}
+    {% if '/by-path/' in d %}
+    wipe_one {{ (d ~ '-part1') | quote }}
+    {% else %}
+    wipe_one {{ (d ~ '1') | quote }}
+    {% endif %}
+    {% endfor %}
+    {% for s in asm_symlinks | default([]) %}
+    wipe_one {{ ('/dev/oracleasm/' ~ s.name) | quote }}
+    {% endfor %}
+  args:
+    executable: /bin/bash
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - asm_wipe_stale_headers | default(true) | bool
+    - gi_asm_disk_list is defined
+    - (gi_asm_disk_list | length) > 0
+  become: true

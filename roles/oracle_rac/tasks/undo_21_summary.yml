@@ -1,4 +1,0 @@
----
-- name: Undo 21 (no-op)
-  ansible.builtin.debug:
-    msg: "Summary is informational only. Undo 21 does not delete /tmp/rac_environment_summary.html."

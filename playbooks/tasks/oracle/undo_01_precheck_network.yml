@@ -1,0 +1,8 @@
+---
+# Reverse step 01 blockinfile in /etc/hosts (marker must match 01_precheck_network.yml).
+- name: Undo 01 remove Ansible-managed RAC hosts block from /etc/hosts
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} ANSIBLE RAC HOSTS"
+    state: absent
+  failed_when: false

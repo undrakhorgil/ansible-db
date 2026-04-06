@@ -1,4 +1,0 @@
----
-- name: Undo 18 (no-op)
-  ansible.builtin.debug:
-    msg: "Postcheck only."

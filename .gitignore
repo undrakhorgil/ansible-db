@@ -9,6 +9,10 @@ __pycache__/
 *.retry
 ansible.log
 
-# Generated report (step 21)
+# oradbctl.sh step DONE/FAILED tracking (local only)
+.oradbctl.state
+
+# Generated report (step 18)
+grid_environment_summary.html
 rac_environment_summary.html
 

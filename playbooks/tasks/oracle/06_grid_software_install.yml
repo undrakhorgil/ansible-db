@@ -1,0 +1,50 @@
+---
+# Step 6: unzip Grid Infrastructure image zip into GRID_HOME (standalone server / Oracle Restart).
+# Oracle docs require unzipping the image into the final Grid home path.
+
+- name: Check configured Grid zip exists on primary
+  ansible.builtin.stat:
+    path: "{{ oracle_grid_software_zip }}"
+  register: grid_zip_stat
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+- name: Fail if configured Grid zip is missing
+  ansible.builtin.assert:
+    that:
+      - grid_zip_stat.stat.exists
+    fail_msg: >-
+      Configured Grid zip not found: {{ oracle_grid_software_zip }}.
+      Fix group_vars/all.yml oracle_grid_software_zip path.
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+- name: Ensure GRID_HOME exists before unzip
+  ansible.builtin.file:
+    path: "{{ grid_home }}"
+    state: directory
+    owner: "{{ grid_user }}"
+    group: "{{ oinstall_group }}"
+    mode: "0775"
+  become: true
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+# Root runs unarchive (writable ansible_remote_tmp + can stat dest); grid_user cannot always traverse /u01/... parents as module user.
+- name: Unzip grid software on primary
+  become: true
+  ansible.builtin.unarchive:
+    src: "{{ oracle_grid_software_zip }}"
+    dest: "{{ grid_home }}"
+    remote_src: true
+    owner: "{{ grid_user }}"
+    group: "{{ oinstall_group }}"
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+- name: Enforce grid ownership on extracted GI home
+  become: true
+  ansible.builtin.file:
+    path: "{{ grid_home }}"
+    state: directory
+    owner: "{{ grid_user }}"
+    group: "{{ oinstall_group }}"
+    recurse: true
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+

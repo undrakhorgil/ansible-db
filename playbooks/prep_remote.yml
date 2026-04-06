@@ -1,6 +1,6 @@
 ---
 - name: Prep remote nodes
-  hosts: oracle_rac_servers
+  hosts: oracle_managed_hosts
   gather_facts: false
   become: true
   vars:

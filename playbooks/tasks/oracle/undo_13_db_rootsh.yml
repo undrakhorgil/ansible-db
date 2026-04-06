@@ -1,0 +1,6 @@
+---
+- name: Undo 13 note — DB root.sh is not safely automated
+  ansible.builtin.debug:
+    msg: >-
+      Undo 13: DB root.sh changes (permissions, /etc/oratab, etc.) are not reversed here.
+      After undo 12 (deinstall) and removing ORACLE_HOME, fix /etc/oratab and kernel settings manually if required.

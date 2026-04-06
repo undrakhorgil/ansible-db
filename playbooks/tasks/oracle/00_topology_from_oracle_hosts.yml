@@ -1,0 +1,46 @@
+---
+# Oracle Restart: single node. Inventory uses host_ip as the Ansible name; Oracle/GI use the target's real hostname.
+
+- name: Gather minimal facts (short hostname, default IPv4)
+  ansible.builtin.setup:
+    gather_subset:
+      - '!all'
+      - 'min'
+
+- name: Resolve oracle_hosts entry for this SSH target
+  ansible.builtin.set_fact:
+    oracle_host_entry: >-
+      {{
+        (oracle_hosts | selectattr('host_ip', 'equalto', (ansible_host | default(inventory_hostname) | string)) | list | first)
+        | default(oracle_hosts | first, true)
+      }}
+
+- name: Build topology (Oracle node name = ansible_hostname on target)
+  ansible.builtin.set_fact:
+    rac_nodes:
+      - name: "{{ ansible_hostname }}"
+        public_ip: "{{ oracle_host_entry.host_ip }}"
+        private_ip: "{{ oracle_host_entry.private_ip | default(oracle_host_entry.host_ip) }}"
+        vip_name: "{{ oracle_host_entry.vip_name | default(ansible_hostname) }}"
+        vip_ip: "{{ oracle_host_entry.vip_ip | default(oracle_host_entry.host_ip) }}"
+        role: "{{ oracle_host_entry.role | default('HUB') }}"
+    rac_primary_node: "{{ ansible_hostname }}"
+    rac_domain: "{{ oracle_hosts_domain }}"
+    rac_public_subnet: "{{ oracle_public_subnet }}"
+    rac_private_subnet: "{{ oracle_private_subnet if (oracle_use_private_network | default(false) | bool) else oracle_public_subnet }}"
+    rac_grid_network_iface_role_public: "{{ oracle_grid_iface_role_public }}"
+    rac_grid_network_iface_role_private: "{{ oracle_grid_iface_role_private }}"
+    rac_scan_name: ""
+    rac_scan_ips: []
+    rac_scan_port: "{{ oracle_scan_port | default(1521) }}"
+    rac_cluster_name: "{{ (oracle_cluster_name | default('', true) | trim) or (ansible_hostname | upper) }}"
+
+- name: Assert Oracle Restart single-node inventory
+  ansible.builtin.assert:
+    that:
+      - oracle_hosts | length == 1
+      - rac_nodes | length == 1
+      - (ansible_host | default(inventory_hostname) | string) == (oracle_hosts[0].host_ip | string)
+    fail_msg: >-
+      Oracle Restart: use exactly one oracle_hosts entry and set host_ip to this host's SSH/reachable address
+      ({{ ansible_host | default(inventory_hostname) }} must match oracle_hosts[0].host_ip).

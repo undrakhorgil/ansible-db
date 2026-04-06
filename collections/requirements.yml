@@ -1,4 +1,3 @@
 ---
-collections:
-  - name: ansible.posix
-    version: ">=1.5.0"
+# Optional: add collections here if roles use them (e.g. ansible.posix was removed with SSH automation).
+collections: []

@@ -2,44 +2,25 @@
 # Credentials
 target_root_password: "Welcome1"
 
-# RAC topology — list every cluster node (any count). Step 10 builds clusterNodes as name:vip:role for each.
-# role is required per node (HUB/LEAF).
-rac_nodes:
-  - name: host01
-    public_ip: 192.168.1.101
-    private_ip: 10.0.0.11
-    vip_name: host01-vip
-    vip_ip: 192.168.1.111
-    role: HUB
-  - name: host02
-    public_ip: 192.168.1.102
-    private_ip: 10.0.0.12
-    vip_name: host02-vip
-    vip_ip: 192.168.1.112
-    role: HUB
+# Ansible remote temp (~/.ansible under oracle/grid often unusable). Step 16 / mount_asm use runuser so modules stay root;
+# if you add become_user: grid|oracle shell tasks, ensure this dir is writable by that user or use the same runuser pattern.
+ansible_remote_tmp: /tmp/.ansible-tmp
 
-rac_primary_node: host01
-rac_scan_name: scan
-# Must be unused on your public LAN. OUI fails INS-40719 if these IPs answer from another host (ARP).
-# Previous 192.168.1.113–115 often collide with other VMs/DHCP; use one free IP for lab SCAN.
-rac_scan_ips:
-  - 192.168.1.203
-  - 192.168.1.204
-  - 192.168.1.205
-rac_scan_port: 1521
-rac_cluster_name: raccluster
-# Subnets for oracle.install.crs.config.networkInterfaceList (network address, not CIDR; must match your netmasks).
-rac_public_subnet: 192.168.1.0
-rac_private_subnet: 10.0.0.0
-# Third field is numeric (gridSetup / OUI). Two-NIC Flex ASM labs: 1=public, 5=private (ASM & Private). Using 2 alone can cause INS-41208 (no ASM subnet).
-rac_grid_network_iface_role_public: "1"
-rac_grid_network_iface_role_private: "5"
-# Optional: full list — skips discovery; use if role IDs differ for your build.
-oracle_grid_network_interface_list: ""
-# Used in /etc/hosts so hostname -f (e.g. host02.localdomain) resolves; must match each node's `hostname -f` domain after step 7.
-rac_domain: localdomain
+# Single host: host_ip is the SSH/reachable address and Ansible inventory name.
+# Oracle Grid/DB use the server's real short hostname (ansible_hostname), e.g. host03 — no need to duplicate it here.
+oracle_hosts:
+  - host_ip: 192.168.1.132
 
-# Oracle homes/users
+# Public subnet for Grid networkInterfaceList (network address, not CIDR; must match netmask on the host).
+oracle_public_subnet: 192.168.1.0
+# Used in /etc/hosts so hostname -f resolves; must match `hostname -f` domain on the server.
+oracle_hosts_domain: localdomain
+
+# Oracle homes/users (26ai)
+# grid_home = GI 26ai; oracle_home = DB 26ai. Each has its own OUI entry — GI being 26 does not fix a DB home that is
+# still registered as 23. For oracle_home, oraversion -majorVersion / -baseVersion must show 26.x (same catalog DBCA uses).
+# If the path is .../26.0.0/... but oraversion shows 23.x, fix the DB home registration (detach/attach or reinstall DB
+# software), not Grid. Step 16 fails fast until DB catalog matches 26ai.
 oracle_base: /u01/app/oracle
 oracle_inventory: /u01/app/oraInventory
 grid_home: /u01/app/26.0.0/grid
@@ -52,26 +33,24 @@ asmadmin_group: asmadmin
 asmdba_group: asmdba
 asmoper_group: asmoper
 
-# Software zips (remote paths on target)
-oracle_grid_software_zip: /tmp/p38753741_230000_Linux-x86-64.zip 
+# Software zips (remote paths on target). The *230000* zips are 23c — oraversion will be 23.x.
+# oracle_home uses …/26.0.0/… while software is 23c — path major ≠ oraversion; step 16 allows that when
+# dbca_enforce_oracle_home_path_matches_oraversion is false (still fails if inventory.xml disagrees with oraversion).
+# Alternative: 26ai DB zip + …/26.0.0/… path, or 23c zip + …/23.0.0/… path with matching folders/install.
+oracle_grid_software_zip: /tmp/p38753741_230000_Linux-x86-64.zip
 oracle_db_software_zip: /tmp/p38743961_230000_Linux-x86-64.zip
 oracle_preinstall_package: oracle-ai-database-preinstall-26ai
 
-# Shared ASM disks — use stable /dev/disk/by-path/ whole-disk paths (no -part1) for partitioning.
-# id_path: exact ID_PATH from the *partition* (udevadm … -n …-part1 | grep ^ID_PATH=). On RHEL/systemd-udev
-# this is usually the *disk* path (no -part1 suffix); rules also use DEVTYPE==partition so the whole disk is not matched.
+# Shared ASM disks — stable /dev/disk/by-path/ whole-disk paths (no -part1) for partitioning.
 asm_disks:
   - /dev/disk/by-path/pci-0000:00:14.0-scsi-0:0:0:0
   - /dev/disk/by-path/pci-0000:00:14.0-scsi-0:0:1:0
 
-# Legacy: use { device: /dev/sdb, name: asm-crs-disk1 } instead of id_path for sdX names.
 asm_symlinks:
   - { id_path: "pci-0000:00:14.0-scsi-0:0:0:0", name: asm-crs-disk1 }
   - { id_path: "pci-0000:00:14.0-scsi-0:0:1:0", name: asm-crs-disk2 }
 
-# Step 19 ASM disk groups (DATA/FRA/custom). Add extra disk(s) + udev, then set disk paths.
-# Per-node SYSASM SID is +ASM1..+ASMn from rac_nodes order (step 19 / undo 19). Override only if your cluster differs.
-asm_instance_sid: "+ASM1"
+# ASM disk groups (DATA/FRA/custom). SYSASM SID is +ASM for Restart.
 asm_diskgroups:
   - name: DATA
     used_for_grid_crs: true
@@ -81,33 +60,14 @@ asm_diskgroups:
     used_for_grid_crs: false
     redundancy: EXTERNAL
     disks: [/dev/oracleasm/asm-crs-disk2]
-# Example:
-# asm_diskgroups:
-#   - name: DATA
-#     used_for_grid_crs: true
-#     redundancy: EXTERNAL
-#     disks:
-#       - /dev/oracleasm/asm-data-disk1
-#   - name: FRA
-#     used_for_grid_crs: false
-#     redundancy: EXTERNAL
-#     disks:
-#       - /dev/oracleasm/asm-fra-disk1
-#   - name: REDO
-#     redundancy: EXTERNAL
-#     disks:
-#       - /dev/oracleasm/asm-redo-disk1
 
-# gridSetup ASM (step 10): discovery glob must include the symlink paths; ASMLib often uses /dev/oracleasm/disks/*
+# gridSetup ASM discovery
 grid_asm_disk_discovery_string: "/dev/oracleasm/*"
-# Comma-separated paths; leave empty to build /dev/oracleasm/<name> from asm_symlinks. CRS needs enough size (installer expects ~2.2+ GiB usable per typical lab).
 grid_asm_disk_list: ""
-# CRS disk group redundancy: EXTERNAL | NORMAL | HIGH (EXTERNAL = no mirroring; typical for single disks per failure group / lab).
 grid_asm_diskgroup_redundancy: EXTERNAL
-# After a failed Grid/ASM install, partitions may still hold ASM headers (INS-30530). Step 6 and step 10 can dd the start of each partition.
-# Set false when disks must not be cleared (e.g. production or existing CRS disk groups).
 asm_wipe_stale_headers: true
-asm_wipe_header_mb: 50
+# Increase if headers persist; useless while disk is still in a DG — run undo 15 / drop FRA and stop HAS first.
+asm_wipe_header_mb: 100
 
 # Passwords
 sys_password: "Welcome1"
@@ -119,24 +79,19 @@ root_user_password_new: "Welcome1"
 oracle_user_password_new: "Welcome1"
 grid_user_password_new: "Welcome1"
 
-# Step 9 runcluvfy.sh: optional extra arguments (e.g. " -verbose")
+# Grid silent install
 oracle_cluvfy_extra_args: ""
-
-# Step 10 gridSetup: use bundled vendor responseFile (required for reliable GI home resolution).
-# Our role sanitizes only the key values we care about.
 oracle_grid_silent_use_bundled_response_file: true
-
-# Step 10 gridSetup install mode:
-# - `CRS_SWONLY`: installs GI software only (no clusterware configuration)
-# - `CRS_CONFIG`: configures/creates CRS/Clusterware (root.sh will be required)
-oracle_grid_install_option: CRS_CONFIG
-# We'll run root.sh explicitly after gridSetup instead of relying on OUI.
 oracle_grid_rootconfig_executeRootScript: false
 
 # Output
 oracle_show_cmd_output: false
 
-# Step 20 DBCA (create database)
+# oradbctl step 16 — DBCA (single-instance on ASM); task file 16_create_orcl_database.yml
+# Skip entire oraversion/path preflight (debug only).
+dbca_skip_db_home_inventory_mismatch_check: false
+# false = allow 23c oraversion under a …/product/26…/ path (this lab). true = path major must match oraversion.
+dbca_enforce_oracle_home_path_matches_oraversion: false
 dbca_gdbname: ORCL
 dbca_sid: ORCL
 dbca_pdb_name: ORCLPDB
@@ -145,20 +100,16 @@ dbca_sys_password: "Welcome1"
 dbca_system_password: "Welcome1"
 dbca_db_snmp_password: "Welcome1"
 dbca_pdb_admin_password: "Welcome1"
-# diskGroupName (datafiles + default spfile) should be the CRS DG (here DATA) so CRS starts it before ora.*.db — spfile on a non-CRS DG (e.g. FRA) causes ORA-15001 at startup.
 dbca_data_diskgroup: DATA
 dbca_recovery_diskgroup: FRA
 dbca_recovery_area_size_mb: 20480
+# Explicit db_create_file_dest / db_recovery_file_dest in -initParams — helps some RMAN seed-clone restores on ASM.
+dbca_pass_init_params: true
 dbca_ignore_prereq_checks: true
-# Step 20: minimum free space (MB) in ASM disk groups before DBCA (avoid RMAN restore failures).
 dbca_asm_min_free_mb_data: 4096
 dbca_asm_min_free_mb_fra: 4096
-# Step 20: if true, runs the same cleanup as undo 20 before DBCA (stops DB, deleteDatabase, srvctl remove, asmcmd rm ORCL paths).
 dbca_drop_existing_before_create: true
-# Undo 20: remove +DATA/+FRA subtrees for db_unique_name; set false to only DBCA/srvctl (leave ASM files).
 undo_20_remove_asm_paths: true
-# Undo 20: remove admin/cfgtoollogs/diag/audit/dbs and oratab on all RAC nodes.
 undo_20_clean_local_files: true
 undo_20_clean_oratab: true
-# Undo 20: max seconds for DBCA deleteDatabase (prevents indefinite hang).
 dbca_undo_timeout_seconds: 3600

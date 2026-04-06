@@ -2,7 +2,9 @@
 
 Run as **root** unless noted.
 
-This runbook is a manual mirror of the Ansible flow. Treat `group_vars/all.yml` as the source of truth and use this document when you need to run the same actions by hand.
+The Ansible playbooks target **Oracle Restart on a single host** (exactly one entry in `oracle_hosts`). **Canonical automation** uses **`gridSetup.sh -silent -configureStandaloneServer`** (Ansible **step 7**). Many fenced blocks below still show **two-node RAC**, **SCAN**, or **`CRS_CONFIG`**; treat those as **optional reference** unless you are building RAC by hand.
+
+**`group_vars/all.yml`**, **[`README.md`](README.md)** (steps **1–18**), and **`bash oradbctl.sh -l`** are the source of truth. Use this file when you run commands manually or debug installers.
 
 **Every fenced `bash` block that needs paths or secrets starts with `# --- LAB VARS ---`.** Edit those lines to match your site, then paste the whole block.
 
@@ -14,24 +16,45 @@ Avoid `$`, ```, and `!` in passwords you paste into heredoc blocks; use simple l
 - Use this manual when you need to **do the same thing by hand**, or when the installer requires interactive troubleshooting.
 
 **Ansible (this repo):** `ansible-playbook playbooks/site.yml` or `bash oradbctl.sh -s …` / `-u …` against `inventory.yml`.
-- Steps **1–7** run on all hosts in `oracle_rac_servers`.
-- Steps **8+** run mostly on `rac_primary_node` for unzip/install.
-- `undo 8` empties `GRID_HOME` contents in place.
-- `undo 10` runs Oracle deinstall.
+- Steps **1–5** run on the managed host (`oracle_managed_hosts`).
+- Steps **6+** run mostly on the primary target (`oracle_hosts[0].host_ip`) for unzip/install.
+- `undo 6` empties `GRID_HOME` contents in place.
+- `undo 7` re-runs `cleanup_grid_install_state.yml` (locator/inventory pointers), not a full GI deinstall.
 
-For the canonical step names/order (1–22), use `README.md` and `bash oradbctl.sh -l`.
-This manual focuses on the operator-heavy actions, so section numbers may skip some Ansible-only/internal steps.
+For the canonical **oradbctl** order (**1–18**), use **`README.md`** and **`bash oradbctl.sh -l`**.
+
+**Heading mismatch:** Section titles below (e.g. “Step 09”) are **historical** and may not match **oradbctl** numbers. For Restart, prefer the **configureStandaloneServer** flow described in **`README.md`** and the Grid step table.
+
+### Configuration (manual snippets ↔ Ansible)
+
+Every **`# --- LAB VARS ---`** block should match **`group_vars/all.yml`**. Full **required inputs** and explanations: **[`README.md`](README.md)** → **Configure**.
+
+| In `group_vars/all.yml` | Typical manual snippet names |
+|---|---|
+| **`target_root_password`** | Ansible only; same password if you SSH as root manually |
+| **`oracle_hosts[0].host_ip`** | **`PUB_IP`**, SSH target |
+| **`oracle_hosts_domain`**, OS short hostname | **`DOMAIN`**, **`SHORT`** in `/etc/hosts` snippets |
+| **`oracle_public_subnet`** | Public subnet in legacy RAC **`NET_LIST`** |
+| **`oracle_base`**, **`oracle_inventory`**, **`grid_home`**, **`oracle_home`** | **`ORACLE_BASE`**, **`INVENTORY_LOC`**, **`GRID_HOME`**, **`ORACLE_HOME`** |
+| **`oracle_grid_software_zip`**, **`oracle_db_software_zip`** | **`GI_ZIP`**, **`DB_ZIP`** (on the **target** host) |
+| **`oracle_preinstall_package`** | Same RPM as Ansible step 2 when mirroring packages |
+| **`asm_symlinks`**, **`asm_disks`** | Udev **`ID_PATH`**, **`DISK1`/`DISK2`** |
+| **`asm_diskgroups`** (**`used_for_grid_crs: true`**) | **`CRS_DG`**, **`DISK_LIST`**, **`REDUNDANCY`**, **`DISK_STRING`** for Restart Grid install |
+| **`dbca_data_diskgroup`**, **`dbca_recovery_diskgroup`** | DBCA / ASM names |
+| **`sys_password`**, **`dbca_*`** | **`SYS_PW`**, database passwords |
+
+Tunables: **`playbooks/vars/oracle_defaults.yml`**. Secrets: optional **`group_vars/vault.yml`** with **`ansible-playbook --ask-vault-pass`**.
 
 ---
 
-### Quick checklist (before Step 08)
+### Quick checklist (before Step 06 / GI unzip)
 
 - `/etc/hosts` consistent (Step 01/05)
 - `chronyd` running (Step 02)
 - `grid`/`oracle` users exist (Step 03)
 - `ORACLE_BASE`/`GRID_HOME`/`ORACLE_HOME` exist (Step 04)
-- ASM device symlinks exist under `/dev/oracleasm` (Step 06)
-- Passwordless SSH works for `grid` (Step 07)
+- ASM device symlinks exist under `/dev/oracleasm` (Ansible step **5** / `05_shared_disks_udev.yml`)
+- Passwordless SSH works for `grid` (manual prep below)
 
 ## Step 01 — `/etc/hosts` + SCAN check (all nodes)
 

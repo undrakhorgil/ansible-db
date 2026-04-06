@@ -1,0 +1,25 @@
+---
+# Step 4 only: empty Oracle-related directories (see group_vars paths).
+- name: Create empty ORACLE_BASE, oraInventory, GRID_HOME, and DB ORACLE_HOME directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ oracle_base }}", owner: "{{ oracle_user }}", group: "{{ oinstall_group }}", mode: "0775" }
+    - { path: "{{ oracle_inventory }}", owner: "{{ grid_user }}", group: "{{ oinstall_group }}", mode: "0775" }
+    - { path: "{{ grid_home }}", owner: "{{ grid_user }}", group: "{{ oinstall_group }}", mode: "0775" }
+    - { path: "{{ oracle_home }}", owner: "{{ oracle_user }}", group: "{{ oinstall_group }}", mode: "0775" }
+
+# Fix dirs created before oracle user existed (ls showed 54321:oinstall instead of oracle:oinstall).
+- name: Recursively normalize ORACLE_BASE owner (oracle:oinstall)
+  ansible.builtin.file:
+    path: "{{ oracle_base }}"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: "{{ oinstall_group }}"
+    mode: "0775"
+    recurse: true
+  when: oracle_recurse_chown_oracle_base | default(true) | bool

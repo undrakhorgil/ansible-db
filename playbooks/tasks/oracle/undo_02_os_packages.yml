@@ -1,0 +1,22 @@
+---
+# Step 02 installs many base packages + preinstall; only preinstall is removed here (safe). Optional firewalld restore.
+- name: Undo 02 remove Oracle preinstall package
+  ansible.builtin.shell: "dnf -y remove {{ oracle_preinstall_package }} || true"
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
+
+- name: Undo 02 re-enable firewalld (step 02 disabled it)
+  ansible.builtin.service:
+    name: firewalld
+    state: started
+    enabled: true
+  when: oracle_undo_02_restore_firewalld | default(false) | bool
+  failed_when: false
+
+- name: Undo 02 note — base RPMs, SELinux, chronyd unchanged
+  ansible.builtin.debug:
+    msg: >-
+      Undo 02 removed only {{ oracle_preinstall_package }}. Step 02 also installed many OS packages, set SELinux permissive,
+      disabled firewalld, and enabled chronyd — not auto-reverted (set oracle_undo_02_restore_firewalld: true to start firewalld).

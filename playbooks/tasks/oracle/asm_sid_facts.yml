@@ -1,0 +1,6 @@
+---
+# Oracle Restart: ASM SID is +ASM (single instance).
+- name: Set ASM instance SID for this host
+  ansible.builtin.set_fact:
+    asm_instance_sid_for_node: "+ASM"
+    asm_instance_sid: "+ASM"

@@ -1,6 +1,0 @@
----
-# Undo 12: executeConfigTools cannot be safely reversed independently.
-- name: Undo 12 no-op
-  ansible.builtin.debug:
-    msg: "executeConfigTools is not reversible; use undo 10 (GI deinstall) if you need to roll back."
-

@@ -1,0 +1,21 @@
+---
+- name: Build dynamic inventory
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Validate basic vars
+      ansible.builtin.assert:
+        that:
+          - target_root_password | length > 0
+          - oracle_hosts | length == 1
+          - oracle_hosts[0].host_ip is defined
+          - oracle_hosts[0].host_ip | trim | length > 0
+        quiet: true
+
+    # Inventory name = host_ip so it always matches the connection target; Oracle hostname comes from ansible_hostname in 00_topology.
+    - name: Add Oracle target hosts
+      ansible.builtin.add_host:
+        name: "{{ item.host_ip }}"
+        groups: oracle_managed_hosts
+        ansible_host: "{{ item.host_ip }}"
+      loop: "{{ oracle_hosts }}"

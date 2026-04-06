@@ -1,0 +1,33 @@
+---
+# Reverse step 03: PAM limits drop-in, limits.conf block, then grid/oracle users (stop Grid/DB first).
+- name: Undo 03 remove limits.d file from step 3
+  ansible.builtin.file:
+    path: /etc/security/limits.d/99-oracle-rac.conf
+    state: absent
+  failed_when: false
+
+- name: Undo 03 remove limits.conf block from step 3
+  ansible.builtin.blockinfile:
+    path: /etc/security/limits.conf
+    marker: "# {mark} ANSIBLE ORACLE RAC LIMITS"
+    state: absent
+  failed_when: false
+
+- name: Undo 03 remove grid user
+  ansible.builtin.user:
+    name: "{{ grid_user }}"
+    state: absent
+    remove: "{{ oracle_undo_remove_user_homes | default(false) | bool }}"
+  failed_when: false
+
+- name: Undo 03 remove oracle user
+  ansible.builtin.user:
+    name: "{{ oracle_user }}"
+    state: absent
+    remove: "{{ oracle_undo_remove_user_homes | default(false) | bool }}"
+  failed_when: false
+
+- name: Undo 03 note — supplemental groups not removed
+  ansible.builtin.debug:
+    msg: >-
+      oinstall/dba/asm* groups were left in place. Set them absent manually if this host is fully de-Oracle’d.

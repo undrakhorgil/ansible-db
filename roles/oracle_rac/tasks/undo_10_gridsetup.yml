@@ -1,5 +1,0 @@
----
-# Undo 10: gridSetup (use same GI deinstall flow)
-- name: Undo 10 include GI deinstall tasks
-  ansible.builtin.import_tasks: undo_10_grid_config.yml
-

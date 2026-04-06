@@ -1,0 +1,212 @@
+---
+# Undo 16: tear down the DBCA-created DB — CRS/srvctl, DBCA, SQL*Plus drop, ASM subtrees, local files.
+# Shell tasks use root + runuser so ansible_remote_tmp (/tmp/.ansible-tmp) stays writable.
+
+# --- Primary only: CRS + logical drop + ASM file purge ---
+
+- name: Undo 16 stop database if CRS still knows it
+  become: true
+  ansible.builtin.shell: |
+    set -euo pipefail
+    runuser -u "{{ grid_user }}" -- /bin/bash <<'EOSCRIPT'
+    set -euo pipefail
+    export ORACLE_HOME="{{ grid_home }}"
+    export ORACLE_SID='{{ asm_instance_sid | default("+ASM") }}'
+    export PATH="$ORACLE_HOME/bin:$PATH"
+    srvctl status database -d "{{ dbca_sid }}" &>/dev/null || exit 0
+    srvctl stop database -d "{{ dbca_sid }}" -o immediate || true
+    EOSCRIPT
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+  failed_when: false
+  changed_when: false
+
+- name: Undo 16 drop database with DBCA when CRS has a database resource
+  become: true
+  ansible.builtin.shell: |
+    set -euo pipefail
+    runuser -u "{{ oracle_user }}" -- /bin/bash <<'EOSCRIPT'
+    set -euo pipefail
+    export ORACLE_HOME="{{ oracle_home }}"
+    export ORACLE_BASE="{{ oracle_base }}"
+    export PATH="{{ grid_home }}/bin:$ORACLE_HOME/bin:$PATH"
+    unset ORACLE_SID
+    if ! srvctl config database -d "{{ dbca_sid }}" &>/dev/null; then
+      echo "CRS has no database {{ dbca_sid }}; skipping DBCA deleteDatabase."
+      exit 0
+    fi
+    timeout "{{ dbca_undo_timeout_seconds | default(3600) }}" \
+      "$ORACLE_HOME/bin/dbca" -silent -deleteDatabase \
+      -sourceDB "{{ dbca_gdbname }}" \
+      -sysDBAUserName sys \
+      -sysDBAPassword "{{ dbca_sys_password }}"
+    EOSCRIPT
+  args:
+    executable: /bin/bash
+  register: undo16_dbca_delete
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+  failed_when: false
+  changed_when: undo16_dbca_delete.rc == 0
+
+- name: Undo 16 remove database from CRS
+  become: true
+  ansible.builtin.shell: |
+    set -euo pipefail
+    runuser -u "{{ grid_user }}" -- /bin/bash <<'EOSCRIPT'
+    set -euo pipefail
+    export ORACLE_HOME="{{ grid_home }}"
+    export ORACLE_SID='{{ asm_instance_sid | default("+ASM") }}'
+    export PATH="$ORACLE_HOME/bin:$PATH"
+    srvctl remove database -d "{{ dbca_sid }}" -deleterel force -noprompt || true
+    EOSCRIPT
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+  failed_when: false
+  changed_when: false
+
+# After CRS config is gone (or never existed): drop any remaining datafiles if spfile/init still present (failed DBCA, etc.).
+- name: Undo 16 SQL*Plus DROP DATABASE INCLUDING DATAFILES if instance files remain
+  become: true
+  ansible.builtin.shell: |
+    set -euo pipefail
+    runuser -u "{{ oracle_user }}" -- /bin/bash <<'EOSCRIPT'
+    set -euo pipefail
+    export ORACLE_HOME="{{ oracle_home }}"
+    export ORACLE_BASE="{{ oracle_base }}"
+    export ORACLE_SID="{{ dbca_sid }}"
+    export PATH="{{ grid_home }}/bin:$ORACLE_HOME/bin:$PATH"
+    DBS="$ORACLE_HOME/dbs"
+    if [[ ! -f "$DBS/spfile{{ dbca_sid }}.ora" && ! -f "$DBS/init{{ dbca_sid }}.ora" && ! -f "$DBS/spfile{{ dbca_sid }}.ORA" ]]; then
+      exit 0
+    fi
+    if srvctl config database -d "{{ dbca_sid }}" &>/dev/null; then
+      echo "CRS still has database {{ dbca_sid }}; skipping SQL*Plus drop (re-run after srvctl remove succeeds)."
+      exit 0
+    fi
+    set +e
+    sqlplus -s / as sysdba <<'EOSQL'
+    WHENEVER SQLERROR CONTINUE
+    shutdown abort;
+    startup mount exclusive restrict;
+    DROP DATABASE INCLUDING DATAFILES;
+    shutdown abort;
+    EXIT;
+    EOSQL
+    exit 0
+    EOSCRIPT
+  args:
+    executable: /bin/bash
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - undo_16_sqlplus_drop_without_crs | default(true) | bool
+  failed_when: false
+  changed_when: false
+
+- name: Undo 16 build ASM subtree names to remove under DATA and FRA disk groups
+  ansible.builtin.set_fact:
+    undo16_asm_subtree_names: "{{ ([dbca_gdbname | string, dbca_sid | string] + (undo_16_asm_extra_subtrees | default([]) | map('string') | list)) | map('trim') | list | unique }}"
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+- name: Undo 16 remove ASM database subtrees on DATA and FRA (all configured names)
+  become: true
+  ansible.builtin.shell: |
+    set -euo pipefail
+    runuser -u "{{ grid_user }}" -- /bin/bash <<'EOSCRIPT'
+    set -uo pipefail
+    export ORACLE_HOME="{{ grid_home }}"
+    export ORACLE_SID='{{ asm_instance_sid | default("+ASM") }}'
+    export PATH="$ORACLE_HOME/bin:$PATH"
+    {% for dg in [dbca_data_diskgroup, dbca_recovery_diskgroup] %}
+    {% for n in undo16_asm_subtree_names | default([dbca_gdbname, dbca_sid]) | unique %}
+    if asmcmd ls "+{{ dg }}/{{ n }}" &>/dev/null; then
+      asmcmd rm -rf "+{{ dg }}/{{ n }}" || true
+    fi
+    {% endfor %}
+    {% endfor %}
+    exit 0
+    EOSCRIPT
+  args:
+    executable: /bin/bash
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - undo_20_remove_asm_paths | default(true) | bool
+  failed_when: false
+  changed_when: false
+
+# --- All nodes: Oracle Base / OH files tied to this DB ---
+
+- name: Undo 16 remove database admin directory (all nodes)
+  become: true
+  ansible.builtin.file:
+    path: "{{ oracle_base }}/admin/{{ dbca_sid }}"
+    state: absent
+  when: undo_20_clean_local_files | default(true) | bool
+
+- name: Undo 16 remove fast_recovery_area subtree for this SID (all nodes)
+  become: true
+  ansible.builtin.file:
+    path: "{{ oracle_base }}/fast_recovery_area/{{ dbca_sid }}"
+    state: absent
+  when:
+    - undo_20_clean_local_files | default(true) | bool
+    - undo_16_clean_fast_recovery_area | default(true) | bool
+
+- name: Undo 16 remove DBCA cfgtoollogs for this database (gdbname and sid paths) (all nodes)
+  become: true
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ oracle_base }}/cfgtoollogs/dbca/{{ dbca_gdbname }}"
+    - "{{ oracle_base }}/cfgtoollogs/dbca/{{ dbca_sid }}"
+  when: undo_20_clean_local_files | default(true) | bool
+
+- name: Undo 16 remove ADR diag trees for this database (all nodes)
+  become: true
+  ansible.builtin.file:
+    path: "{{ oracle_base }}/diag/rdbms/{{ item }}"
+    state: absent
+  loop: "{{ [dbca_gdbname, dbca_sid] | map('lower') | unique | list }}"
+  when: undo_20_clean_local_files | default(true) | bool
+
+- name: Undo 16 remove audit directories for instance(s) of this DB (all nodes)
+  become: true
+  ansible.builtin.shell: |
+    set -euo pipefail
+    runuser -u "{{ oracle_user }}" -- /bin/bash <<'EOSCRIPT'
+    set +e
+    rm -rf "{{ oracle_base }}/audit/{{ dbca_sid }}"*
+    exit 0
+    EOSCRIPT
+  args:
+    executable: /bin/bash
+  when: undo_20_clean_local_files | default(true) | bool
+  failed_when: false
+  changed_when: false
+
+- name: Undo 16 remove local ORACLE_HOME/dbs init/spfile/orapw for this SID (all nodes)
+  become: true
+  ansible.builtin.shell: |
+    set +e
+    runuser -u "{{ oracle_user }}" -- /bin/bash <<'EOSCRIPT'
+    DBS="{{ oracle_home }}/dbs"
+    rm -f "${DBS}/init{{ dbca_sid }}"*.ora "${DBS}/spfile{{ dbca_sid }}"*.ora "${DBS}/orapw{{ dbca_sid }}" "${DBS}/lk{{ dbca_sid }}" 2>/dev/null
+    exit 0
+    EOSCRIPT
+  args:
+    executable: /bin/bash
+  when: undo_20_clean_local_files | default(true) | bool
+  failed_when: false
+  changed_when: false
+
+- name: Undo 16 remove oratab entry for this SID (all nodes)
+  become: true
+  ansible.builtin.lineinfile:
+    path: /etc/oratab
+    regexp: '^{{ dbca_sid | regex_escape }}:.*'
+    state: absent
+  when:
+    - undo_20_clean_local_files | default(true) | bool
+    - undo_20_clean_oratab | default(true) | bool

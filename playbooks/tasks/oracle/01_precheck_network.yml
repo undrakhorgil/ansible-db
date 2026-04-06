@@ -1,0 +1,36 @@
+---
+# Oracle Restart: /etc/hosts for this node only (no SCAN / no cluster peers).
+
+- name: Configure hosts block for this server
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} ANSIBLE RAC HOSTS"
+    block: |
+      {% for n in rac_nodes %}
+      {{ n.public_ip }} {{ n.name }} {{ n.name }}.{{ rac_domain }}
+      {% if oracle_use_private_network | default(false) | bool %}
+      {{ n.private_ip }} {{ n.name }}-priv
+      {% endif %}
+      {% if n.vip_ip | default(n.public_ip) != n.public_ip %}
+      {{ n.vip_ip }} {{ n.vip_name }}
+      {% endif %}
+      {% endfor %}
+
+- name: Assert inventory matches configured host_ip (hostname may differ; e.g. inventory 192.168.x.x vs host03)
+  ansible.builtin.assert:
+    that:
+      - (ansible_host | default(inventory_hostname) | string) == (oracle_hosts[0].host_ip | string)
+
+- name: Check primary public name resolves
+  ansible.builtin.command: "getent hosts {{ rac_primary_node }}"
+  register: primary_host_resolution
+  changed_when: false
+  failed_when: false
+
+- name: Assert primary host name resolves
+  ansible.builtin.assert:
+    that:
+      - primary_host_resolution.rc == 0
+    fail_msg: >-
+      getent hosts {{ rac_primary_node }} failed (rc={{ primary_host_resolution.rc }}).
+      Ensure /etc/hosts or DNS maps the host name to host_ip from oracle_hosts.

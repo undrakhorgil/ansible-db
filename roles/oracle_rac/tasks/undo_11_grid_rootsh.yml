@@ -1,6 +1,0 @@
----
-# Undo 11: root.sh cannot be safely reversed independently.
-- name: Undo 11 no-op
-  ansible.builtin.debug:
-    msg: "root.sh execution is not reversible; use undo 10 (GI deinstall) if you need to roll back."
-

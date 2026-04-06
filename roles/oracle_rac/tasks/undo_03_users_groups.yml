@@ -1,8 +1,0 @@
----
-- name: Undo 03 remove oracle user
-  ansible.builtin.user:
-    name: "{{ oracle_user }}"
-    state: absent
-    remove: false
-  failed_when: false
-  changed_when: false

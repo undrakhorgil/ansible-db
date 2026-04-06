@@ -1,0 +1,8 @@
+---
+# Stop HAS first (releases ASM/OCR handles), then clear locator metadata so gridSetup can be re-run.
+- name: Undo 07 stop HAS before clearing Grid locators
+  ansible.builtin.import_tasks: crsctl_stop_has_graceful.yml
+  when: oracle_undo_07_stop_has | default(true) | bool
+
+- name: Undo 07 cleanup Grid metadata under /etc/oracle and central inventory pointers
+  ansible.builtin.import_tasks: cleanup_grid_install_state.yml

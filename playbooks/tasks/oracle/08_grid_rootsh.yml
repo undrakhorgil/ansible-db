@@ -1,0 +1,113 @@
+---
+# Step 8: run Grid Infrastructure root scripts for standalone server install.
+
+- name: Run GI root.sh (Oracle Restart / HAS)
+  when: inventory_hostname in (groups['oracle_managed_hosts'] | default([]))
+  block:
+    - name: Ensure /etc/oracle/scls_scr/<host>/grid exists for roothas.pl
+      ansible.builtin.file:
+        path: "/etc/oracle/scls_scr/{{ ansible_hostname }}/grid"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      become: true
+
+    # OUI creates this for a new oraInventory; it must run before $GRID_HOME/root.sh or privileged
+    # steps stay incomplete and executeConfigTools will keep asking for root.sh.
+    - name: Run orainstRoot.sh when present (new central inventory)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        OIR="{{ oracle_inventory }}/orainstRoot.sh"
+        if [ -f "$OIR" ] && [ -x "$OIR" ]; then
+          echo "Running $OIR (inventory bootstrap) ..."
+          export ORACLE_HOSTNAME="{{ oracle_grid_hostname | default(ansible_hostname, true) }}"
+          cd "{{ oracle_inventory }}"
+          ./orainstRoot.sh
+        else
+          echo "Skipping orainstRoot.sh (not present or not executable): $OIR"
+        fi
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: root
+      register: gi_orainst_root
+      changed_when: "'Running' in (gi_orainst_root.stdout | default(''))"
+
+    - name: Execute GI root.sh
+      ansible.builtin.shell: |
+        set -euo pipefail
+        export ORACLE_HOSTNAME="{{ oracle_grid_hostname | default(ansible_hostname, true) }}"
+        echo "Running root.sh on $(hostname -f) ORACLE_HOSTNAME=$ORACLE_HOSTNAME ..."
+        cd "{{ grid_home }}"
+        export ORACLE_HOME="{{ grid_home }}"
+        export GRID_HOME="{{ grid_home }}"
+        export ORACLE_BASE="{{ oracle_base }}"
+        ./root.sh
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: root
+      register: gi_rootsh
+      changed_when: gi_rootsh.rc == 0
+
+    - name: Stat OLR after root.sh
+      ansible.builtin.stat:
+        path: /etc/oracle/olr.loc
+      register: gi_olr_after_root
+
+    - name: Assert OLR exists after root.sh (privileged step actually completed)
+      ansible.builtin.assert:
+        that:
+          - gi_olr_after_root.stat.exists | default(false)
+        fail_msg: >-
+          /etc/oracle/olr.loc is missing after root.sh — privileged configuration did not complete.
+          Check {{ grid_home }}/install/root_*.log and Oracle inventory under {{ oracle_inventory }}.
+
+  rescue:
+    - name: Tail newest Grid root.sh log under install/
+      ansible.builtin.shell: |
+        set -euo pipefail
+        GH="{{ grid_home }}"
+        LOG=$(ls -1t "$GH/install"/root_*.log 2>/dev/null | head -1 || true)
+        if [ -n "$LOG" ] && [ -f "$LOG" ]; then
+          echo "=== $LOG (last 150 lines) ==="
+          tail -n 150 "$LOG"
+        else
+          echo "No root_*.log under $GH/install"
+          ls -la "$GH/install" 2>/dev/null || true
+        fi
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: root
+      register: gi_rootsh_log_tail
+      changed_when: false
+      failed_when: false
+
+    - name: Fail with root.sh exit code and log excerpt
+      ansible.builtin.fail:
+        msg: |-
+          GI root.sh failed (rc={{ gi_rootsh.rc | default('?') }}). The real error is in the log below (search for SEVERE / FAILED / INS- / CRS-).
+
+          --- root.sh stdout ---
+          {{ gi_rootsh.stdout | default('(empty)') }}
+
+          --- log tail ---
+          {{ gi_rootsh_log_tail.stdout | default('(none)') }}
+
+- name: Fix ADR diag permissions for CRSCTL (DIA-49801/49802)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    D="{{ oracle_base }}/diag"
+    if [ -d "$D" ]; then
+      chown -R "{{ grid_user }}:{{ oinstall_group }}" "$D" 2>/dev/null || true
+      chmod -R {{ oracle_adr_diag_mode | default('0775') }} "$D" 2>/dev/null || true
+    fi
+  args:
+    executable: /bin/bash
+  become: true
+  become_user: root
+  when: inventory_hostname in (groups['oracle_managed_hosts'] | default([]))
+  changed_when: true
+

@@ -1,5 +1,0 @@
----
-- name: Undo 17 no-op
-  ansible.builtin.debug:
-    msg: "DB root.sh execution is not reversible; use DB deinstall undo if rollback is required."
-

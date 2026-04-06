@@ -1,0 +1,19 @@
+---
+# Undo 06: clear GRID_HOME contents (keep empty dir) so step 6 can unzip again.
+
+- name: Undo 06 clear GI home contents on all nodes (keep GRID_HOME directory)
+  ansible.builtin.shell: |
+    set -e
+    GH="{{ grid_home }}"
+    [ -d "$GH" ] || exit 0
+    find "$GH" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+  args:
+    executable: /bin/bash
+  become: true
+  become_user: root
+  failed_when: false
+  changed_when: true
+
+- name: Undo 06 clear Grid locators after GI tree removal
+  ansible.builtin.import_tasks: cleanup_grid_install_state.yml
+

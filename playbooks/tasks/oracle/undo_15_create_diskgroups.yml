@@ -1,0 +1,95 @@
+---
+# Undo 15: drop only non-CRS disk groups from asm_diskgroups (never CRS / +GRID used_for_grid_crs: true).
+
+- name: Import ASM SID facts for this host
+  ansible.builtin.import_tasks: asm_sid_facts.yml
+
+- name: Undo 15 skip diskgroup drop when no non-CRS diskgroups are configured
+  ansible.builtin.debug:
+    msg: "Skipping undo 15 — no asm_diskgroups entries with used_for_grid_crs: false."
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - (asm_diskgroups | default([]) | rejectattr('used_for_grid_crs', 'equalto', true) | list | length) == 0
+
+# Mounted disk groups must be DISMOUNTED on every ASM instance before DROP (RAC). CRS disk groups are skipped by when:.
+# Root runs the module (ansible_remote_tmp); sqlplus as grid (same as step 16 / mount_asm).
+- name: Undo 15 dismount non-CRS ASM disk groups on all nodes (sqlplus as SYSASM)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    runuser -u "{{ grid_user }}" -- /bin/bash <<'EOSCRIPT'
+    set -euo pipefail
+    export ORACLE_HOME="{{ grid_home }}"
+    export ORACLE_SID='{{ asm_instance_sid_for_node }}'
+    export PATH="$ORACLE_HOME/bin:$PATH"
+    sqlplus -s "/ as sysasm" <<'EOSQL'
+    SET HEADING OFF FEEDBACK OFF VERIFY OFF ECHO OFF PAGESIZE 0
+    WHENEVER SQLERROR CONTINUE
+    ALTER DISKGROUP {{ dg.name }} DISMOUNT FORCE;
+    EXIT;
+    EOSQL
+    EOSCRIPT
+  args:
+    executable: /bin/bash
+  become: true
+  register: asm_dg_dismount
+  loop: "{{ asm_diskgroups | default([]) }}"
+  loop_control:
+    loop_var: dg
+    label: "{{ dg.name }}"
+  changed_when: false
+  failed_when: false
+  when:
+    - not (dg.used_for_grid_crs | default(false) | bool)
+
+- name: Undo 15 drop non-CRS ASM disk groups (sqlplus as SYSASM)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    runuser -u "{{ grid_user }}" -- /bin/bash <<'EOSCRIPT'
+    set -euo pipefail
+    export ORACLE_HOME="{{ grid_home }}"
+    export ORACLE_SID='{{ asm_instance_sid_for_node }}'
+    export PATH="$ORACLE_HOME/bin:$PATH"
+    sqlplus -s "/ as sysasm" <<'EOSQL'
+    SET HEADING OFF FEEDBACK OFF VERIFY OFF ECHO OFF PAGESIZE 0
+    WHENEVER SQLERROR EXIT SQL.SQLCODE
+    DROP DISKGROUP {{ dg.name }} INCLUDING CONTENTS;
+    EXIT;
+    EOSQL
+    EOSCRIPT
+  args:
+    executable: /bin/bash
+  become: true
+  register: asm_dg_drop
+  loop: "{{ asm_diskgroups | default([]) }}"
+  loop_control:
+    loop_var: dg
+    label: "{{ dg.name }}"
+  changed_when: false
+  failed_when: false
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - not (dg.used_for_grid_crs | default(false) | bool)
+
+# DROP DISKGROUP clears ASM metadata; Clusterware may still show ora.<dg>.dg (OFFLINE). Remove OCR registration.
+- name: Undo 15 remove clusterware ASM disk group resource (srvctl)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    runuser -u "{{ grid_user }}" -- /bin/bash <<'EOSCRIPT'
+    set -euo pipefail
+    export ORACLE_HOME="{{ grid_home }}"
+    export PATH="$ORACLE_HOME/bin:$PATH"
+    srvctl remove diskgroup -diskgroup "{{ dg.name }}" -force
+    EOSCRIPT
+  args:
+    executable: /bin/bash
+  become: true
+  register: asm_dg_srvctl_remove
+  changed_when: false
+  failed_when: false
+  loop: "{{ asm_diskgroups | default([]) }}"
+  loop_control:
+    loop_var: dg
+    label: "{{ dg.name }}"
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - not (dg.used_for_grid_crs | default(false) | bool)

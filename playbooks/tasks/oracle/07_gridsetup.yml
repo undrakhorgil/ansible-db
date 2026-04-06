@@ -1,0 +1,245 @@
+---
+# Step 7: Install and configure Oracle Grid Infrastructure for a standalone server (Oracle Restart).
+# Uses 26ai CLI mode: gridSetup.sh -silent -configureStandaloneServer.
+#
+# Root scripts are run in step 8. Config tools are run in step 9.
+
+- name: Clean stale Grid metadata before gridSetup (inventory + /etc/oracle)
+  ansible.builtin.import_tasks: cleanup_grid_install_state.yml
+
+# If a prior install left HAS/ASM up, dd wipe is skipped and OUI hits INS-30516 (DG exists) + INS-30530 (bad headers).
+- name: Detect asm_pmon before gridSetup disk prep
+  ansible.builtin.shell: |
+    n=0
+    for p in /proc/[0-9]*; do
+      i=${p#/proc/}
+      [[ "$i" =~ ^[0-9]+$ ]] || continue
+      (( 10#$i == $$ )) && continue
+      [ -r "$p/cmdline" ] && [ -r "$p/exe" ] || continue
+      exe=$(readlink -f "$p/exe" 2>/dev/null || true)
+      [[ "$exe" == */bin/oracle ]] || [[ "$exe" == */bin/oracle.bin ]] || continue
+      cl=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null || true)
+      [[ "$cl" == *asm_pmon* && "$cl" == *ASM* ]] || continue
+      n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] && echo yes || echo no
+  args:
+    executable: /bin/bash
+  register: _gi_precheck_asm
+  changed_when: false
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+  become: true
+
+- name: Stop HAS when ASM is running (allows header wipe + fresh CRS disk group)
+  ansible.builtin.import_tasks: stop_has_when_asm_up.yml
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - asm_stop_has_before_gridsetup_wipe | default(true) | bool
+    - (_gi_precheck_asm.stdout | default('no') | trim) == 'yes'
+
+- name: Refuse gridSetup while ASM is running if automatic HAS stop is disabled
+  ansible.builtin.fail:
+    msg: >-
+      ASM (asm_pmon) is still running. gridSetup will fail with INS-30516 / INS-30530 (existing CRS disk group / bad disk headers).
+      Run as root: {{ grid_home }}/bin/crsctl stop has [-f], drop non-CRS DGs if needed (undo 15), re-run step 5 then step 7;
+      or set asm_stop_has_before_gridsetup_wipe: true in group_vars (default).
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - not (asm_stop_has_before_gridsetup_wipe | default(true) | bool)
+    - (_gi_precheck_asm.stdout | default('no') | trim) == 'yes'
+
+- name: Wipe stale ASM headers before gridSetup (optional)
+  ansible.builtin.import_tasks: wipe_asm_partition_headers.yml
+  when: asm_wipe_stale_headers | default(true) | bool
+
+- name: Assert required grid setup variables are explicitly set
+  ansible.builtin.assert:
+    that:
+      - grid_asm_disk_discovery_string is defined
+      - asm_diskgroups is defined
+      - (asm_diskgroups | length) > 0
+      - (asm_diskgroups | selectattr('used_for_grid_crs', 'defined') | selectattr('used_for_grid_crs', 'equalto', true) | list | length) == 1
+    fail_msg: >-
+      Missing/invalid required variables for Grid setup. Ensure grid_asm_disk_discovery_string is set and exactly one
+      asm_diskgroups entry has used_for_grid_crs: true in group_vars/all.yml.
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+- name: Set grid CRS diskgroup from flagged asm_diskgroups entry
+  ansible.builtin.set_fact:
+    gi_crs_diskgroup: "{{ (asm_diskgroups | selectattr('used_for_grid_crs', 'defined') | selectattr('used_for_grid_crs', 'equalto', true) | list | first) }}"
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+- name: Assert flagged grid CRS diskgroup is fully configured
+  ansible.builtin.assert:
+    that:
+      - gi_crs_diskgroup.name is defined
+      - (gi_crs_diskgroup.name | trim | length) > 0
+      - gi_crs_diskgroup.redundancy is defined
+      - (gi_crs_diskgroup.redundancy | trim | length) > 0
+      - gi_crs_diskgroup.disks is defined
+      - (gi_crs_diskgroup.disks | length) > 0
+    fail_msg: >-
+      The diskgroup flagged with used_for_grid_crs: true must include name/redundancy/disks.
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+- name: Compute disk list for Grid setup
+  ansible.builtin.set_fact:
+    gi_install_dg_name: "{{ gi_crs_diskgroup.name }}"
+    gi_install_dg_redundancy: "{{ gi_crs_diskgroup.redundancy }}"
+    gi_asm_disk_list: "{% for d in gi_crs_diskgroup.disks %}{{ d }}{% if not loop.last %},{% endif %}{% endfor %}"
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+- name: Ensure ORACLE_BASE exists (installer expects it)
+  ansible.builtin.file:
+    path: "{{ oracle_base }}"
+    state: directory
+    owner: "{{ grid_user }}"
+    group: "{{ oinstall_group }}"
+    mode: "0775"
+  become: true
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+- name: Verify ASM block devices exist before gridSetup
+  ansible.builtin.shell: |
+    set -e
+    IFS=',' read -ra DISKS <<< "{{ gi_asm_disk_list }}"
+    for p in "${DISKS[@]}"; do
+      p="${p#"${p%%[![:space:]]*}"}"
+      p="${p%"${p##*[![:space:]]}"}"
+      [ -b "$p" ] || { echo "Not a block device: $p" >&2; exit 1; }
+    done
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+- name: Assert passwords for silent gridSetup (SYSASM / ASMSNMP — required when stdin is /dev/null)
+  ansible.builtin.assert:
+    that:
+      - sys_password is defined
+      - (sys_password | string | trim | length) > 0
+    fail_msg: >-
+      sys_password must be set (non-empty) in group_vars/vault for silent gridSetup; OUI needs SYSASM and ASMSNMP passwords.
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+# OUI resolves the Grid home from cwd for -configureStandaloneServer; running gridSetup.sh without cd can cause INS-32012.
+- name: Ensure Grid home parent path exists (traversable for grid user)
+  ansible.builtin.file:
+    path: "{{ grid_home | dirname }}"
+    state: directory
+    owner: root
+    group: "{{ oinstall_group }}"
+    mode: "0755"
+  become: true
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+- name: Ensure Grid home exists and is writable by grid (INS-32012)
+  ansible.builtin.file:
+    path: "{{ grid_home }}"
+    state: directory
+    owner: "{{ grid_user }}"
+    group: "{{ oinstall_group }}"
+    mode: "0775"
+  become: true
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+- name: Mandatory ASM header zero immediately before gridSetup (same paths as -diskList; min 256 MiB)
+  ansible.builtin.import_tasks: mandatory_asm_wipe_for_gridsetup.yml
+
+- name: Run gridSetup.sh (silent, configureStandaloneServer)
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+  block:
+    # Root runs the module (ansible_remote_tmp); gridSetup runs as grid inside GRID_HOME (same pattern as step 16 / unzip).
+    - name: Execute gridSetup.sh -configureStandaloneServer
+      become: true
+      ansible.builtin.shell: |
+        set -euo pipefail
+        runuser -u "{{ grid_user }}" -- /bin/bash <<'EOSCRIPT'
+        set -euo pipefail
+        GS="{{ grid_home }}/gridSetup.sh"
+        [ -x "$GS" ] || { echo "Missing gridSetup.sh under {{ grid_home }} (run step 6 first)"; exit 1; }
+
+        export HOME="/home/{{ grid_user }}"
+        export ORACLE_HOME="{{ grid_home }}"
+        export GRID_HOME="{{ grid_home }}"
+        export ORACLE_BASE="{{ oracle_base }}"
+        export PATH="{{ grid_home }}/bin:${PATH:-}"
+        export DISPLAY=""
+        export ORACLE_HOSTNAME="{{ oracle_grid_hostname | default(ansible_hostname, true) }}"
+        cd "{{ grid_home }}"
+        echo "gridSetup start $(date -Is) pwd=$(pwd) ORACLE_HOSTNAME=$ORACLE_HOSTNAME — silent GI install can take 30–120+ minutes with little output; use -vv for Ansible polling."
+        # Close stdin so nothing waits for interactive input (OUI).
+        exec /bin/bash "$GS" -silent -ignorePrereqFailure -waitforcompletion \
+          -configureStandaloneServer \
+          -OSDBA "{{ asmdba_group }}" -OSASM "{{ asmadmin_group }}" -OSOPER "{{ asmoper_group }}" \
+          -ORACLE_BASE "{{ oracle_base }}" \
+          -dbDiskGroupName "{{ gi_install_dg_name }}" \
+          -diskList "{{ gi_asm_disk_list }}" \
+          -redundancy "{{ gi_install_dg_redundancy }}" \
+          -diskString "{{ grid_asm_disk_discovery_string }}" \
+          -INVENTORY_LOCATION "{{ oracle_inventory }}" \
+          oracle.install.asm.SYSASMPassword={{ sys_password | quote }} \
+          oracle.install.asm.monitorPassword={{ sys_password | quote }} \
+          </dev/null
+        EOSCRIPT
+      args:
+        executable: /bin/bash
+      async: "{{ oracle_grid_setup_async_seconds | default(14400) | int }}"
+      poll: "{{ oracle_grid_setup_poll_seconds | default(30) | int }}"
+      register: gi_setup_run
+      failed_when: gi_setup_run.rc not in [0, 6]
+      changed_when: gi_setup_run.rc in [0, 6]
+
+  rescue:
+    - name: Fail with gridSetup stderr/stdout tail and log path
+      ansible.builtin.fail:
+        msg: |-
+          gridSetup step failed.
+
+          {% if ansible_failed_result is defined and (ansible_failed_result.msg | default('') | length > 0) %}
+          Ansible/module message: {{ ansible_failed_result.msg }}
+          {% endif %}
+          {% if gi_setup_run is not defined or gi_setup_run.rc is not defined %}
+          No gridSetup rc captured — the shell task may have failed before OUI ran. Scroll up for the first FAILED task in this play.
+          {% else %}
+          gridSetup exit code: {{ gi_setup_run.rc }} (0 and 6 = success; 254 = generic installer failure).
+          {% endif %}
+
+          INS-32012: OUI cwd / GRID_HOME — step 7 cds to {{ grid_home }}; ensure step 6 unzipped there; disk space; avoid broken symlinks.
+          INS-00001 / clone-template: stale OUI state — cleanup_grid_install_state; or undo 6 + step 6.
+          ClassNotFoundException / InstallerPatchDriver: incomplete GI home — undo 6 + step 6 to restore {{ grid_home }}/install.
+          INS-30516 / INS-30530: CRS disk group name or disk headers already used — step 7 stops HAS when asm_stop_has_before_gridsetup_wipe (default true), then wipes; or manually crsctl stop has, undo 15, step 5, step 7.
+
+          Log dirs: {{ grid_home }}/cfgtoollogs/  {{ oracle_inventory }}/logs/
+
+          --- stderr (last 80 lines) ---
+          {{ ((gi_setup_run.stderr | default('') | split('\n'))[-80:] | join('\n')) if gi_setup_run is defined else '(register missing)' }}
+
+          --- stdout (last 80 lines) ---
+          {{ ((gi_setup_run.stdout | default('') | split('\n'))[-80:] | join('\n')) if gi_setup_run is defined else '(register missing)' }}
+
+- name: Capture grid session response file for executeConfigTools
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - gi_setup_run is defined
+    - gi_setup_run.rc | int in [0, 6]
+  block:
+    - name: Find latest grid_*.rsp from this gridSetup session
+      ansible.builtin.shell: |
+        set -euo pipefail
+        RSP=""
+        if [ -d "{{ grid_home }}/install/response" ]; then
+          RSP=$(ls -1t "{{ grid_home }}/install/response"/grid_*.rsp 2>/dev/null | head -n1 || true)
+        fi
+        if [ -z "$RSP" ] && [ -d "{{ grid_home }}/response" ]; then
+          RSP=$(ls -1t "{{ grid_home }}/response"/grid_*.rsp 2>/dev/null | head -n1 || true)
+        fi
+        printf '%s' "$RSP"
+      args:
+        executable: /bin/bash
+      register: gi_rsp_capture
+      changed_when: false
+
+    - name: Save oracle_grid_session_rsp for step 09
+      ansible.builtin.set_fact:
+        oracle_grid_session_rsp: "{{ gi_rsp_capture.stdout | trim }}"
+      when: (gi_rsp_capture.stdout | default('') | trim | length) > 0

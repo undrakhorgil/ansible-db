@@ -1,0 +1,96 @@
+---
+# oinstall first (optional fixed GID via oinstall_gid in group_vars — see oracle_defaults.yml).
+# If step 3 fails with "usermod: user oracle is currently used by process …", stop HAS/DB/listener as oracle or unset *_uid / oinstall_gid.
+- name: Ensure oinstall group exists
+  ansible.builtin.group:
+    name: "{{ oinstall_group }}"
+    gid: "{{ oinstall_gid | default(omit) }}"
+    state: present
+
+- name: Ensure supplemental Oracle/Grid groups exist
+  ansible.builtin.group:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - "{{ dba_group }}"
+    - "{{ asmadmin_group }}"
+    - "{{ asmdba_group }}"
+    - "{{ asmoper_group }}"
+
+# Password on first create only (update_password: on_create) so step 18 remains the supported rotation path.
+# Existing users created before this field was added have no password until you run step 18 once or: echo 'oracle:…' | chpasswd
+- name: Ensure oracle user exists
+  ansible.builtin.user:
+    name: "{{ oracle_user }}"
+    uid: "{{ oracle_user_uid | default(omit) }}"
+    group: "{{ oinstall_group }}"
+    groups: "{{ dba_group }},{{ asmdba_group }},{{ asmadmin_group }}"
+    append: true
+    shell: /bin/bash
+    home: "/home/{{ oracle_user }}"
+    create_home: true
+    state: present
+    password: "{{ oracle_user_password_new | password_hash('sha512') }}"
+    update_password: on_create
+
+- name: Ensure grid user exists
+  ansible.builtin.user:
+    name: "{{ grid_user }}"
+    uid: "{{ grid_user_uid | default(omit) }}"
+    group: "{{ oinstall_group }}"
+    groups: "{{ asmadmin_group }},{{ asmdba_group }},{{ asmoper_group }},{{ dba_group }}"
+    append: true
+    shell: /bin/bash
+    home: "/home/{{ grid_user }}"
+    create_home: true
+    state: present
+    password: "{{ grid_user_password_new | password_hash('sha512') }}"
+    update_password: on_create
+
+# Preinstall/manual installs can leave /home/oracle owned by bare 54321; fix owner/group (recursive) without chmod on files.
+- name: Recursively normalize oracle login home owner/group
+  ansible.builtin.file:
+    path: "/home/{{ oracle_user }}"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: "{{ oinstall_group }}"
+    recurse: true
+
+- name: Set oracle login home directory mode (top-level only)
+  ansible.builtin.file:
+    path: "/home/{{ oracle_user }}"
+    state: directory
+    mode: "0700"
+
+- name: Recursively normalize grid login home owner/group
+  ansible.builtin.file:
+    path: "/home/{{ grid_user }}"
+    state: directory
+    owner: "{{ grid_user }}"
+    group: "{{ oinstall_group }}"
+    recurse: true
+
+- name: Set grid login home directory mode (top-level only)
+  ansible.builtin.file:
+    path: "/home/{{ grid_user }}"
+    state: directory
+    mode: "0700"
+
+- name: Remove legacy memlock-only drop-in (replaced by 99-oracle-rac.conf)
+  ansible.builtin.file:
+    path: /etc/security/limits.d/99-oracle-rac-memlock.conf
+    state: absent
+
+- name: Install Oracle RAC PAM limits (limits.d — primary)
+  ansible.builtin.template:
+    src: pam-limits-oracle-rac.j2
+    dest: /etc/security/limits.d/99-oracle-rac.conf
+    mode: "0644"
+
+- name: Mirror Oracle RAC PAM limits in limits.conf
+  ansible.builtin.blockinfile:
+    path: /etc/security/limits.conf
+    marker: "# {mark} ANSIBLE ORACLE RAC LIMITS"
+    block: "{{ lookup('template', 'pam-limits-oracle-rac.j2') }}"
+
+# Empty oracle_base, oraInventory, grid_home, oracle_home — see 04_create_folders.yml.

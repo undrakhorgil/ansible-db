@@ -1,0 +1,513 @@
+---
+# oradbctl step 16 / task file 16_create_orcl_database.yml — create database with DBCA on primary node.
+
+- name: Assert DBCA variables are set
+  ansible.builtin.assert:
+    that:
+      - dbca_gdbname is defined
+      - dbca_sid is defined
+      - dbca_character_set is defined
+      - dbca_sys_password is defined
+      - dbca_system_password is defined
+      - dbca_db_snmp_password is defined
+      - dbca_pdb_admin_password is defined
+      - dbca_data_diskgroup is defined
+      - dbca_recovery_diskgroup is defined
+    fail_msg: "Define dbca_* variables in group_vars/all.yml for oradbctl step 16 (DBCA)."
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+# DBCA uses OracleHome.getVersion — same catalog as oraversion. 26ai oraversion has -majorVersion / -baseVersion (not -versionNumber). Local inventory.xml can disagree with central OUI.
+# Run as root so Ansible does not use /home/oracle/.ansible/tmp (often missing or mode 700 parent blocks oracle).
+- name: Check DB home oraversion vs path product major (fail fast; matches DBCA getVersion)
+  become: true
+  ansible.builtin.shell: |
+    set -euo pipefail
+    HO="{{ oracle_home }}"
+    ENFORCE_PATH="{{ '1' if dbca_enforce_oracle_home_path_matches_oraversion | default(true) | bool else '0' }}"
+    export ORACLE_HOME="$HO"
+    export PATH="$HO/bin:$PATH"
+    PATH_MAJ=""
+    if [[ "$HO" =~ /product/([0-9]+)\. ]]; then
+      PATH_MAJ="${BASH_REMATCH[1]}"
+    fi
+    INV="${HO}/inventory/ContentsXML/inventory.xml"
+    IV=""
+    IV_MAJ=""
+    if [[ -f "$INV" ]]; then
+      IV=$(grep -oE '<VERSION>[0-9.]+</VERSION>' "$INV" 2>/dev/null | head -1 | sed 's/<VERSION>//;s/<\/VERSION>//' || true)
+      if [[ -n "$IV" ]]; then
+        IV_MAJ="${IV%%.*}"
+      fi
+    fi
+    ORA_VER=""
+    ORA_MAJ=""
+    ORA_MAJ_DIRECT=""
+    if [[ -x "$HO/bin/oraversion" ]]; then
+      ORA_MAJ_DIRECT=$("$HO/bin/oraversion" -majorVersion 2>/dev/null | head -1 | tr -d '\r\n ' || true)
+      ORA_VER=$("$HO/bin/oraversion" -baseVersion 2>/dev/null | head -1 | tr -d '\r\n ' || true)
+    fi
+    if [[ -z "$ORA_MAJ_DIRECT" && -n "$ORA_VER" ]]; then
+      ORA_MAJ_DIRECT="${ORA_VER%%.*}"
+    fi
+    if [[ -n "$ORA_MAJ_DIRECT" ]]; then
+      ORA_MAJ="$ORA_MAJ_DIRECT"
+    elif [[ -n "$IV_MAJ" ]]; then
+      ORA_VER="$IV"
+      ORA_MAJ="$IV_MAJ"
+    fi
+    # Broken home: local inventory VERSION disagrees with oraversion (always fatal when both present).
+    if [[ -n "$ORA_MAJ_DIRECT" && -n "$IV_MAJ" && "$ORA_MAJ_DIRECT" != "$IV_MAJ" ]]; then
+      echo "MISMATCH: inventory.xml VERSION major ${IV_MAJ} vs oraversion major ${ORA_MAJ_DIRECT} under ${HO}." >&2
+      echo "Fix local OUI for this ORACLE_HOME (detachHome + attachHome or reinstall). Bypass: dbca_skip_db_home_inventory_mismatch_check: true" >&2
+      exit 2
+    fi
+    if [[ -z "$ORA_MAJ" ]]; then
+      echo "ERROR: Could not determine DB home version (oraversion and inventory.xml missing or empty) for ${HO}." >&2
+      exit 2
+    fi
+    if [[ -n "$PATH_MAJ" && -n "$ORA_MAJ" && "$ORA_MAJ" != "$PATH_MAJ" ]]; then
+      if [[ "$ENFORCE_PATH" == "1" ]]; then
+        echo "MISMATCH: oraversion reports ${ORA_VER} (major ${ORA_MAJ}) but ORACLE_HOME path product major is ${PATH_MAJ} (${HO})." >&2
+        echo "Remediation: Align path and software, or set dbca_enforce_oracle_home_path_matches_oraversion: false if the path is only a naming convention. Full bypass: dbca_skip_db_home_inventory_mismatch_check: true" >&2
+        exit 2
+      fi
+      echo "WARN: path product major ${PATH_MAJ} != oraversion major ${ORA_MAJ} — continuing (dbca_enforce_oracle_home_path_matches_oraversion=false)." >&2
+    fi
+    echo "OK: path_major=${PATH_MAJ:-?} oraversion=${ORA_VER:-unknown} inventory_major=${IV_MAJ:-n/a}"
+  args:
+    executable: /bin/bash
+  register: db_home_inv_check
+  changed_when: false
+  failed_when: db_home_inv_check.rc == 2
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - not (dbca_skip_db_home_inventory_mismatch_check | default(false) | bool)
+
+# Documented in group_vars but previously not wired: clears partial CRS/DBCA/ASM paths that cause RMAN restore failures.
+- name: Remove prior partial database install before DBCA (oradbctl undo 16)
+  ansible.builtin.import_tasks: undo_16_create_orcl_database.yml
+  when: dbca_drop_existing_before_create | default(false) | bool
+
+# runuser: avoid become_user + ansible_remote_tmp (/tmp/.ansible-tmp) — grid cannot create module tmp if dir is root-only.
+- name: Verify required ASM diskgroups exist before DBCA
+  become: true
+  ansible.builtin.shell: |
+    set -euo pipefail
+    runuser -u "{{ grid_user }}" -- /bin/bash <<'EOSCRIPT'
+    set -euo pipefail
+    export ORACLE_HOME="{{ grid_home }}"
+    export ORACLE_SID='{{ asm_instance_sid | default("+ASM") }}'
+    export PATH="$ORACLE_HOME/bin:$PATH"
+    sqlplus -s "/ as sysasm" <<'EOSQL'
+    SET HEADING OFF FEEDBACK OFF VERIFY OFF ECHO OFF PAGESIZE 0
+    WHENEVER SQLERROR EXIT SQL.SQLCODE
+    SELECT UPPER(name) FROM v$asm_diskgroup
+    WHERE UPPER(name) IN (UPPER('{{ dbca_data_diskgroup }}'), UPPER('{{ dbca_recovery_diskgroup }}'))
+    ORDER BY 1;
+    EXIT;
+    EOSQL
+    EOSCRIPT
+  args:
+    executable: /bin/bash
+  register: asm_dg_precheck
+  changed_when: false
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+- name: Assert ASM diskgroups are available for DBCA
+  ansible.builtin.assert:
+    that:
+      - (dbca_data_diskgroup | upper) in (asm_dg_precheck.stdout | upper)
+      - (dbca_recovery_diskgroup | upper) in (asm_dg_precheck.stdout | upper)
+    fail_msg: >-
+      Required ASM diskgroups are not available for DBCA.
+      Ensure oradbctl step 15 is complete (non-CRS disk groups), then rerun step 16 (DBCA).
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+- name: Query ASM free_mb for DBCA data disk group
+  become: true
+  ansible.builtin.shell: |
+    set -euo pipefail
+    runuser -u "{{ grid_user }}" -- /bin/bash <<'EOSCRIPT'
+    set -euo pipefail
+    export ORACLE_HOME="{{ grid_home }}"
+    export ORACLE_SID='{{ asm_instance_sid | default("+ASM") }}'
+    export PATH="$ORACLE_HOME/bin:$PATH"
+    sqlplus -s "/ as sysasm" <<'EOSQL'
+    SET HEADING OFF FEEDBACK OFF VERIFY OFF PAGESIZE 0
+    WHENEVER SQLERROR EXIT SQL.SQLCODE
+    SELECT TRIM(TO_CHAR(free_mb)) FROM v$asm_diskgroup WHERE UPPER(name) = UPPER('{{ dbca_data_diskgroup }}');
+    EXIT;
+    EOSQL
+    EOSCRIPT
+  args:
+    executable: /bin/bash
+  register: asm_free_mb_data_dg
+  changed_when: false
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+- name: Query ASM free_mb for DBCA recovery disk group
+  become: true
+  ansible.builtin.shell: |
+    set -euo pipefail
+    runuser -u "{{ grid_user }}" -- /bin/bash <<'EOSCRIPT'
+    set -euo pipefail
+    export ORACLE_HOME="{{ grid_home }}"
+    export ORACLE_SID='{{ asm_instance_sid | default("+ASM") }}'
+    export PATH="$ORACLE_HOME/bin:$PATH"
+    sqlplus -s "/ as sysasm" <<'EOSQL'
+    SET HEADING OFF FEEDBACK OFF VERIFY OFF PAGESIZE 0
+    WHENEVER SQLERROR EXIT SQL.SQLCODE
+    SELECT TRIM(TO_CHAR(free_mb)) FROM v$asm_diskgroup WHERE UPPER(name) = UPPER('{{ dbca_recovery_diskgroup }}');
+    EXIT;
+    EOSQL
+    EOSCRIPT
+  args:
+    executable: /bin/bash
+  register: asm_free_mb_rec_dg
+  changed_when: false
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+- name: Assert ASM free space before DBCA (avoid RMAN restore / space failures)
+  ansible.builtin.assert:
+    that:
+      - asm_free_mb_data_dg.stdout | trim | int >= (dbca_asm_min_free_mb_data | default(4096) | int)
+      - asm_free_mb_rec_dg.stdout | trim | int >= (dbca_asm_min_free_mb_fra | default(4096) | int)
+    fail_msg: >-
+      ASM free_mb too low: {{ dbca_data_diskgroup }}={{ asm_free_mb_data_dg.stdout | trim }} (need >= {{ dbca_asm_min_free_mb_data | default(4096) }}),
+      {{ dbca_recovery_diskgroup }}={{ asm_free_mb_rec_dg.stdout | trim }} (need >= {{ dbca_asm_min_free_mb_fra | default(4096) }}).
+      Grow disk groups or lower dbca_recovery_area_size_mb / dbca_asm_min_free_mb_* in group_vars.
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+# Step-16-only runs may skip step 15; HAS can start ora.*.db before +DATA/+FRA are mounted (ORA-15001) without this.
+- name: Import ASM SID facts for pre-DBCA mount
+  ansible.builtin.import_tasks: asm_sid_facts.yml
+
+- name: Mount all ASM disk groups on every node before DBCA
+  ansible.builtin.import_tasks: mount_asm_diskgroups.yml
+
+# RMAN restore during DBCA needs both DGs MOUNTED; v$asm_diskgroup lists DISMOUNTED groups too.
+- name: Verify DATA and FRA (DBCA) ASM diskgroups are MOUNTED before DBCA
+  become: true
+  ansible.builtin.shell: |
+    set -euo pipefail
+    runuser -u "{{ grid_user }}" -- /bin/bash <<'EOSCRIPT'
+    set -euo pipefail
+    export ORACLE_HOME="{{ grid_home }}"
+    export ORACLE_SID='{{ asm_instance_sid_for_node }}'
+    export PATH="$ORACLE_HOME/bin:$PATH"
+    sqlplus -s "/ as sysasm" <<'EOSQL'
+    SET HEADING OFF FEEDBACK OFF VERIFY OFF PAGESIZE 0
+    WHENEVER SQLERROR EXIT SQL.SQLCODE
+    SELECT COUNT(*) FROM v$asm_diskgroup
+    WHERE UPPER(name) IN (UPPER('{{ dbca_data_diskgroup | replace("'", "''") }}'), UPPER('{{ dbca_recovery_diskgroup | replace("'", "''") }}'))
+      AND state = 'MOUNTED';
+    EXIT;
+    EOSQL
+    EOSCRIPT
+  args:
+    executable: /bin/bash
+  register: asm_dbca_dg_mounted_cnt
+  changed_when: false
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+- name: Assert ASM diskgroups for DBCA are both MOUNTED
+  ansible.builtin.assert:
+    that:
+      - asm_dbca_dg_mounted_cnt.stdout | trim | int == 2
+    fail_msg: >-
+      Expected both {{ dbca_data_diskgroup }} and {{ dbca_recovery_diskgroup }} MOUNTED in ASM before DBCA (got count={{ asm_dbca_dg_mounted_cnt.stdout | trim }}).
+      Re-run step 16 if DGs are missing; check asm_diskgroups in group_vars matches DBCA names. RMAN "failed to restore datafiles" often follows DISMOUNTED or wrong DG names.
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+# MOS/community: RMAN restore during DBCA on ASM often fails if compatible.rdbms on the DG is below the DB version.
+- name: Set ASM compatible.rdbms on DBCA data and recovery diskgroups
+  become: true
+  ansible.builtin.shell: |
+    set -euo pipefail
+    runuser -u "{{ grid_user }}" -- /bin/bash <<'EOSCRIPT'
+    set -euo pipefail
+    export ORACLE_HOME="{{ grid_home }}"
+    export ORACLE_SID='{{ asm_instance_sid_for_node }}'
+    export PATH="$ORACLE_HOME/bin:$PATH"
+    sqlplus -s "/ as sysasm" <<EOSQL
+    SET HEADING OFF FEEDBACK OFF VERIFY OFF PAGESIZE 0
+    WHENEVER SQLERROR EXIT SQL.SQLCODE
+    ALTER DISKGROUP {{ dbca_data_diskgroup }} SET ATTRIBUTE 'compatible.rdbms' = '{{ oracle_database_compatible_rdbms }}';
+    ALTER DISKGROUP {{ dbca_recovery_diskgroup }} SET ATTRIBUTE 'compatible.rdbms' = '{{ oracle_database_compatible_rdbms }}';
+    EXIT;
+    EOSQL
+    EOSCRIPT
+  args:
+    executable: /bin/bash
+  register: asm_set_compat_rdbms
+  changed_when: asm_set_compat_rdbms.rc == 0
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - (oracle_database_compatible_rdbms | default('') | trim | length) > 0
+
+- name: Ensure Oracle admin directories exist for DBCA
+  become: true
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: "{{ oinstall_group }}"
+    mode: "0775"
+  loop:
+    - "{{ oracle_base }}/admin"
+    - "{{ oracle_base }}/admin/{{ dbca_sid }}"
+    - "{{ oracle_base }}/admin/{{ dbca_sid }}/adump"
+    - "{{ oracle_base }}/admin/{{ dbca_sid }}/dpdump"
+    - "{{ oracle_base }}/admin/{{ dbca_sid }}/pfile"
+
+# Pre-create audit path so DBCA does not hit ORA-48189.
+- name: Ensure Oracle audit base directory exists
+  become: true
+  ansible.builtin.file:
+    path: "{{ oracle_base }}/audit"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: "{{ oinstall_group }}"
+    mode: "0775"
+
+- name: Ensure instance audit directory exists for DBCA
+  become: true
+  ansible.builtin.file:
+    path: "{{ oracle_base }}/audit/{{ dbca_sid }}1"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: "{{ oinstall_group }}"
+    mode: "0775"
+
+- name: Set setuid on oracle binary before DBCA (RMAN clone / ASM)
+  ansible.builtin.file:
+    path: "{{ oracle_home }}/bin/oracle"
+    mode: "06751"
+  become: true
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - dbca_oracle_binary_setuid | default(true) | bool
+
+# Optional -initParams (set_fact avoids embedding raw {% %} inside shell: | for the main init string).
+- name: Build optional DBCA -initParams line
+  ansible.builtin.set_fact:
+    dbca_initparams_continuation: >-
+      {% if dbca_pass_init_params | default(false) | bool %}
+      {{ ("-initParams 'db_create_file_dest=+" ~ dbca_data_diskgroup ~ ",db_recovery_file_dest=+"
+      ~ dbca_recovery_diskgroup ~ ",db_recovery_file_dest_size=" ~ (dbca_recovery_area_size_mb | string) ~ "M'") | trim }}
+      {% else %}
+      {{ '' }}
+      {% endif %}
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+# Single line of optional flags after -recoveryAreaSize (avoids bash trailing-\\ line-continuation bugs).
+- name: Build DBCA optional tail (useOMF, rmanParallelism, initParams)
+  ansible.builtin.set_fact:
+    dbca_optional_tail: >-
+      {{
+        (
+          ('-useOMF true' if (dbca_use_omf | default(true) | bool) else '-useOMF false')
+          ~ ((' -rmanParallelism ' ~ (dbca_rman_parallelism | string)) if (dbca_rman_parallelism | default('', true) | string | trim | length) > 0 else '')
+          ~ ((' ' ~ (dbca_initparams_continuation | default('', true) | trim)) if (dbca_pass_init_params | default(false) | bool) and ((dbca_initparams_continuation | default('', true) | trim) | length) > 0 else '')
+        ) | trim
+      }}
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+# RMAN seed restore reports ORA-15001 if +DATA/+FRA are not MOUNTED in +ASM (CRS ora.*.dg offline) or DB lacks Grid libs in LD_LIBRARY_PATH.
+- name: CRS-start DBCA disk groups and verify MOUNTED in +ASM (immediate pre-dbca; mitigate ORA-15001)
+  become: true
+  ansible.builtin.shell: |
+    set -euo pipefail
+    runuser -u "{{ grid_user }}" -- /bin/bash <<'EOSCRIPT'
+    set -euo pipefail
+    export ORACLE_HOME="{{ grid_home }}"
+    export ORACLE_SID='{{ asm_instance_sid_for_node }}'
+    export PATH="$ORACLE_HOME/bin:$PATH"
+    for DG in "{{ dbca_data_diskgroup }}" "{{ dbca_recovery_diskgroup }}"; do
+      "$ORACLE_HOME/bin/srvctl" start diskgroup -g "$DG" 2>/dev/null || true
+    done
+    # Do not use WHENEVER SQLERROR EXIT SQL.SQLCODE here — some sqlplus builds exit non-zero (e.g. rc=136) even when COUNT succeeds.
+    set +e
+    CNT=$(printf '%s\n' \
+      'SET HEADING OFF FEEDBACK OFF VERIFY OFF ECHO OFF PAGESIZE 0' \
+      "SELECT COUNT(*) FROM v\$asm_diskgroup WHERE UPPER(name) IN (UPPER('{{ dbca_data_diskgroup }}'), UPPER('{{ dbca_recovery_diskgroup }}')) AND state = 'MOUNTED';" \
+      'EXIT;' | sqlplus -s "/ as sysasm")
+    SP_RC=$?
+    set -e
+    CNT=$(echo "$CNT" | tr -d ' \r\n\t')
+    if [[ ! "$CNT" =~ ^[0-9]+$ ]]; then
+      echo "FATAL: sqlplus MOUNTED count did not return a number (rc=$SP_RC, output='$CNT'). Is grid in asmadmin and is +ASM up?" >&2
+      printf '%s\n' \
+        'SET HEADING OFF FEEDBACK OFF VERIFY OFF ECHO OFF PAGESIZE 0' \
+        'SELECT name, state FROM v$asm_diskgroup ORDER BY 1;' \
+        'EXIT;' | sqlplus -s "/ as sysasm" || true
+      exit 1
+    fi
+    if [[ "$CNT" != "2" ]]; then
+      echo "FATAL: expected 2 MOUNTED ASM disk groups for DBCA ({{ dbca_data_diskgroup }}, {{ dbca_recovery_diskgroup }}); got count='${CNT:-}'" >&2
+      printf '%s\n' \
+        'SET HEADING OFF FEEDBACK OFF VERIFY OFF ECHO OFF PAGESIZE 0' \
+        'SELECT name, state FROM v$asm_diskgroup ORDER BY 1;' \
+        'EXIT;' | sqlplus -s "/ as sysasm" || true
+      exit 1
+    fi
+    EOSCRIPT
+  args:
+    executable: /bin/bash
+  register: dbca_asm_immediate_mount
+  changed_when: false
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+
+# Oracle 26+ createDatabase expects -datafileDestination +DISKGROUP with -storageType ASM (-diskGroupName is invalid → INS-04007).
+- name: Create database (DBCA silent)
+  become: true
+  ansible.builtin.shell: |
+    set -euo pipefail
+    runuser -u "{{ oracle_user }}" -- /bin/bash <<'EOSCRIPT'
+    set -euo pipefail
+    export ORACLE_HOME="{{ oracle_home }}"
+    export ORACLE_BASE="{{ oracle_base }}"
+    export ORACLE_SID="{{ dbca_sid }}"
+    export PATH="$ORACLE_HOME/bin:$PATH"
+    # DB lib first; Grid lib so RMAN→ASM channels resolve ORA-15001-style failures on Restart.
+    export LD_LIBRARY_PATH="${ORACLE_HOME}/lib:{{ grid_home }}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+    timeout "{{ dbca_timeout_seconds | default(7200) }}" \
+    "$ORACLE_HOME/bin/dbca" -silent -createDatabase \
+      {{ '-ignorePreReqs' if (dbca_ignore_prereq_checks | default(false) | bool) else '' }} \
+      -templateName General_Purpose.dbc \
+      -gdbName "{{ dbca_gdbname }}" \
+      -sid "{{ dbca_sid }}" \
+      -createAsContainerDatabase true \
+      -numberOfPDBs 1 \
+      -pdbName "{{ dbca_pdb_name }}" \
+      -characterSet "{{ dbca_character_set }}" \
+      -sysPassword "{{ dbca_sys_password }}" \
+      -systemPassword "{{ dbca_system_password }}" \
+      -dbsnmpPassword "{{ dbca_db_snmp_password }}" \
+      -pdbAdminPassword "{{ dbca_pdb_admin_password }}" \
+      -databaseConfigType "{{ dbca_database_config_type | default('SINGLE') }}" \
+      -storageType ASM \
+      -datafileDestination "+{{ dbca_data_diskgroup }}" \
+      -asmsnmpPassword "{{ dbca_asmsnmp_password | default(dbca_db_snmp_password) }}" \
+      -recoveryAreaDestination "+{{ dbca_recovery_diskgroup }}" \
+      -recoveryAreaSize "{{ dbca_recovery_area_size_mb }}" \
+      {{ dbca_optional_tail | default('', true) }}
+
+    EOSCRIPT
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+  register: dbca_create
+  failed_when: false
+
+# Tell CRS which ASM DGs the DB needs so ora.*.db starts after ora.*.dg (avoids ORA-15001 on restart).
+- name: Register database ASM disk group dependencies with CRS
+  ansible.builtin.shell: |
+    set -euo pipefail
+    runuser -u "{{ grid_user }}" -- /bin/bash <<'EOSCRIPT'
+    set -euo pipefail
+    export ORACLE_HOME="{{ grid_home }}"
+    export PATH="$ORACLE_HOME/bin:$PATH"
+    srvctl modify database -db "{{ dbca_sid }}" -diskgroup "{{ dbca_data_diskgroup }},{{ dbca_recovery_diskgroup }}"
+    EOSCRIPT
+  args:
+    executable: /bin/bash
+  become: true
+  register: dbca_srvctl_diskgroups
+  changed_when: dbca_srvctl_diskgroups.rc == 0
+  failed_when: false
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - dbca_create.rc | int == 0
+
+- name: Collect DBCA log tail after failure (primary; run as root so log is readable)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    BASE="{{ oracle_base }}/cfgtoollogs/dbca"
+    LOG=""
+    for f in \
+      "$BASE/{{ dbca_gdbname }}/{{ dbca_sid }}.log" \
+      "$BASE/{{ dbca_gdbname }}/{{ dbca_gdbname }}.log" \
+      "$BASE/{{ dbca_sid }}/{{ dbca_sid }}.log"; do
+      if [[ -f "$f" ]]; then LOG="$f"; break; fi
+    done
+    if [[ -z "$LOG" ]] && command -v find >/dev/null; then
+      LOG="$(find "$BASE" -maxdepth 4 -name '*.log' -type f 2>/dev/null | while read -r p; do
+        printf '%s %s\n' "$(stat -c %Y "$p" 2>/dev/null || echo 0)" "$p"
+      done | sort -rn | head -1 | awk '{print $2}')"
+    fi
+    if [[ -n "${LOG:-}" && -f "$LOG" ]]; then
+      echo "--- tail of $LOG ---"
+      tail -n 200 "$LOG" || true
+    else
+      echo "--- no DBCA log file found; listing $BASE ---"
+      ls -la "$BASE" 2>/dev/null || true
+      find "$BASE" -maxdepth 3 -type f 2>/dev/null | head -40 || true
+    fi
+    TD="$BASE/{{ dbca_sid }}"
+    if [[ -d "$TD" ]]; then
+      echo "--- listing $TD ---"
+      ls -la "$TD" 2>/dev/null || true
+      TF="$(ls -1t "$TD"/trace* 2>/dev/null | head -1 || true)"
+      if [[ -n "${TF:-}" && -f "$TF" ]]; then
+        echo "--- ORA/RMAN lines from DBCA trace (grep; file may be large) ---"
+        grep -E 'ORA-[0-9]{4,5}|RMAN-[0-9]{4,5}|RMAN-[0-9]{3,5}|channel.*(ORA-|error)|unable to create|Permission denied' "$TF" 2>/dev/null | tail -n 120 || echo "(no matching lines)"
+        echo "--- tail of DBCA trace $TF ---"
+        tail -n 200 "$TF" || true
+      fi
+      CR="$TD/CloneRmanRestore.log"
+      if [[ -f "$CR" ]]; then
+        echo "--- CloneRmanRestore.log size (bytes) ---"
+        wc -c "$CR" 2>/dev/null || true
+        echo "--- CloneRmanRestore.log: ORA/RMAN/error lines (case-insensitive scan) ---"
+        grep -iE 'ora-[0-9]+|rman|channel |error |failed|fatal|unable to|segmentation|permission' "$CR" 2>/dev/null | tail -n 120 || echo "(no matching lines)"
+        echo "--- full CloneRmanRestore.log (if <= 65536 bytes) ---"
+        SZ=$(wc -c <"$CR" 2>/dev/null || echo 999999)
+        if [[ "${SZ:-999999}" -le 65536 ]]; then
+          cat "$CR" || true
+        else
+          echo "(file too large; showing last 400 lines only)"
+          tail -n 400 "$CR" || true
+        fi
+      fi
+    fi
+  args:
+    executable: /bin/bash
+  become: true
+  register: dbca_trace_tail
+  changed_when: false
+  failed_when: false
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - dbca_create.rc | int != 0
+
+- name: Fail step 16 when DBCA timed out
+  ansible.builtin.fail:
+    msg: >-
+      DBCA timed out after {{ dbca_timeout_seconds | default(7200) }} seconds.
+      --- DBCA log tail ---
+      {{ dbca_trace_tail.stdout | default('', true) }}
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - dbca_create.rc | int == 124
+
+- name: Fail step 16 when DBCA returns error
+  ansible.builtin.fail:
+    msg: |
+      DBCA failed with rc={{ dbca_create.rc }}.
+      --- stdout ---
+      {{ dbca_create.stdout | default('', true) }}
+      --- stderr ---
+      {{ dbca_create.stderr | default('', true) }}
+      --- DBCA / RMAN log collection (from target host) ---
+      {{ dbca_trace_tail.stdout | default('', true) }}
+      --- Ansible hints (not Oracle log text) ---
+      If trace.log shows OracleHome.getVersion / oraversion disagreeing with the product major in the ORACLE_HOME path (e.g. inventory 23.x under .../product/26.../), that skew is the problem: DBCA uses the same catalog as oraversion. dbca_skip_db_home_inventory_mismatch_check only skips Ansible’s preflight — it does not fix OUI. Remediation: align central inventory with the install (detachHome + attachHome or reinstall), or set oracle_home to a path that matches oraversion; then keep dbca_skip_db_home_inventory_mismatch_check: false.
+      ORA-15001 on +DATA/+FRA: disk group not mounted from the RMAN/ASM client — ensure srvctl/crs has ora.DATA.dg/ora.FRA.dg ONLINE, re-run the pre-DBCA mount task, and keep LD_LIBRARY_PATH including {{ grid_home }}/lib (playbook sets this before dbca).
+      Other causes when inventory matches: ASM compatible.rdbms (five-part; <= compatible.asm), chmod 6751 on {{ oracle_home }}/bin/oracle (dbca_oracle_binary_setuid), dbca_pass_init_params, dbca_recovery_area_size_mb, SELinux, oradbctl undo 16 with dbca_drop_existing_before_create. Inspect ORA/RMAN grep above.
+      CloneRmanRestore.log: {{ oracle_base }}/cfgtoollogs/dbca/{{ dbca_sid }}/CloneRmanRestore.log
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - dbca_create.rc | int not in [0, 124]
+

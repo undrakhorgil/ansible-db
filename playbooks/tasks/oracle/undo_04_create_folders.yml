@@ -1,0 +1,17 @@
+---
+# Reverse step 4 empty dirs (same paths as 04_create_folders.yml). Run after software undos when possible.
+- name: Undo 04 clean Grid metadata before removing Oracle paths
+  ansible.builtin.import_tasks: cleanup_grid_install_state.yml
+
+- name: Undo 04 remove Oracle path directories (DB home, Grid home, inventory, base)
+  ansible.builtin.shell: rm -rf "{{ item }}"
+  args:
+    executable: /bin/bash
+  loop:
+    - "{{ oracle_home }}"
+    - "{{ grid_home }}"
+    - "{{ oracle_inventory }}"
+    - "{{ oracle_base }}"
+  when: item | default('', true) | string | length > 0
+  failed_when: false
+  changed_when: true

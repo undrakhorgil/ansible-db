@@ -1,0 +1,97 @@
+---
+# Zero first N MiB on ASM LUN partitions so OUI sees CANDIDATE (INS-30530). While ASM is up, dd cannot reclaim
+# disks that are still in a disk group — wipes are skipped unless asm_allow_wipe_while_asm_running (risky).
+- name: Detect whether ASM instance process is present (asm_pmon)
+  ansible.builtin.shell: |
+    n=0
+    for p in /proc/[0-9]*; do
+      i=${p#/proc/}
+      [[ "$i" =~ ^[0-9]+$ ]] || continue
+      (( 10#$i == $$ )) && continue
+      [ -r "$p/cmdline" ] && [ -r "$p/exe" ] || continue
+      exe=$(readlink -f "$p/exe" 2>/dev/null || true)
+      [[ "$exe" == */bin/oracle ]] || [[ "$exe" == */bin/oracle.bin ]] || continue
+      cl=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null || true)
+      [[ "$cl" == *asm_pmon* && "$cl" == *ASM* ]] || continue
+      n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] && echo yes || echo no
+  args:
+    executable: /bin/bash
+  register: _asm_pmon_probe
+  changed_when: false
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - asm_wipe_stale_headers | default(true)
+  become: true
+
+- name: Decide whether to run dd-based header wipes
+  ansible.builtin.set_fact:
+    _asm_dd_wipe_active: "{{ (asm_allow_wipe_while_asm_running | default(false) | bool) or (_asm_pmon_probe.stdout | trim != 'yes') }}"
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - asm_wipe_stale_headers | default(true)
+
+- name: Skipping ASM header dd wipe (ASM running — drop DGs / stop HAS, re-run step 5, or asm_allow_wipe_while_asm_running)
+  ansible.builtin.debug:
+    msg: >-
+      ASM is running (asm_pmon). Skipping dd header wipe; disks remain in current disk groups.
+      Run undo 15 and stop HAS, then re-run step 5 — or set asm_allow_wipe_while_asm_running: true (risky).
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - asm_wipe_stale_headers | default(true)
+    - not (_asm_dd_wipe_active | default(true) | bool)
+
+- name: Wipe stale ASM partition headers from asm_symlinks (INS-30530)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    {% if s.id_path is defined %}
+    idp="{{ s.id_path }}"
+    if [[ "$idp" =~ -part[0-9]+$ ]]; then
+      p="/dev/disk/by-path/$idp"
+    else
+      p="/dev/disk/by-path/${idp}-part1"
+    fi
+    {% else %}
+    p="{{ s.device }}1"
+    {% endif %}
+    if [ ! -b "$p" ]; then
+      echo "skip (not a block device): $p"
+      exit 0
+    fi
+    echo "Wiping ASM header region on $p (first {{ asm_wipe_header_mb | default(100) }} MiB)"
+    dd if=/dev/zero of="$p" bs=1M count={{ asm_wipe_header_mb | default(100) }} conv=fsync
+  args:
+    executable: /bin/bash
+  loop: "{{ asm_symlinks | default([]) }}"
+  loop_control:
+    loop_var: s
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - asm_wipe_stale_headers | default(true)
+    - _asm_dd_wipe_active | default(true) | bool
+  become: true
+
+- name: Wipe stale ASM headers on asm_disks partition paths (covers disks not listed in asm_symlinks)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    d="{{ item }}"
+    if [[ "$d" == *"/by-path/"* ]]; then
+      p="${d}-part1"
+    else
+      p="${d}1"
+    fi
+    if [ ! -b "$p" ]; then
+      echo "skip (not a block device): $p"
+      exit 0
+    fi
+    echo "Wiping ASM header region on $p (asm_disks, first {{ asm_wipe_header_mb | default(100) }} MiB)"
+    dd if=/dev/zero of="$p" bs=1M count={{ asm_wipe_header_mb | default(100) }} conv=fsync
+  args:
+    executable: /bin/bash
+  loop: "{{ asm_disks | default([]) }}"
+  when:
+    - inventory_hostname == (groups['oracle_managed_hosts'] | default([]) | first)
+    - asm_wipe_stale_headers | default(true)
+    - _asm_dd_wipe_active | default(true) | bool
+  become: true
